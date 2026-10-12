@@ -5,8 +5,33 @@ A small webhook listener + deployer for Magento release archives stored in S3-co
 ## Build
 
 ```bash
-go build ./...
+make build   # or: go build ./...
+make test
 ```
+
+## Install as systemd service
+
+```bash
+sudo make install
+```
+
+Installs:
+
+- `/usr/local/sbin/magenx-deputy-go`
+- `/etc/magenx-deputy-go/config.yaml` (from `config.example.yaml`, only if missing)
+- `/lib/systemd/system/magenx-deputy-go.service`
+
+The service runs as the Magento site owner, not root, so releases and `bin/magento` output get correct ownership.
+Adjust `User=`, `Group=` and `ReadWritePaths=` in the unit (`systemctl edit magenx-deputy-go`) to the brand user and `<root_dir>/<brand>`, then:
+
+```bash
+sudo chgrp mystore /etc/magenx-deputy-go/config.yaml   # config is 0640, site user must read it
+sudo systemctl daemon-reload
+sudo systemctl enable --now magenx-deputy-go
+journalctl -u magenx-deputy-go -f
+```
+
+Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`, e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `IS_LEADER=false` on non-leader nodes.
 
 ## Run
 

@@ -1,0 +1,46 @@
+[Unit]
+Description=Magenx Deputy (Magento release deployment webhook listener)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/magenx-deputy-go -config /etc/magenx-deputy-go/config.yaml
+Restart=always
+RestartSec=2
+
+# Run as the Magento site owner so extracted releases, symlinks and
+# leader commands (bin/magento) get the right ownership.
+# Adjust to match deploy.default_brand / the brand directory under deploy.root_dir.
+User=mystore
+Group=mystore
+
+# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, ...
+EnvironmentFile=-/etc/magenx-deputy-go/env
+
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# MemoryDenyWriteExecute is intentionally not set: leader commands run PHP
+# (bin/magento), and PCRE JIT / opcache JIT need writable+executable memory.
+
+# Make everything read-only by default
+ProtectSystem=strict
+
+# Allow write only where deputy needs to act.
+# Adjust to <deploy.root_dir>/<brand> in /etc/magenx-deputy-go/config.yaml.
+ReadWritePaths=/home/mystore
+
+[Install]
+WantedBy=multi-user.target
