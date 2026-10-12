@@ -96,12 +96,12 @@ with the error.
 | Failure in | Result |
 |---|---|
 | disk check, download, digest, extract, shared links | staging/new dir removed, `current` untouched |
-| `pre_switch_commands` | new dir removed, `current` untouched. Database changes already made by the command are **not** reverted |
+| `pre_switch_commands` | new dir removed, `current` untouched |
 | `leader_commands`, health check | `current` switched back to the previous release (removed on first deploy), `rollback_commands` run in the previous release; rollback errors are added to the response |
 
-Database migrations are never rolled back. Keep schema changes backward compatible so the previous release
-still runs on the upgraded database, and run `setup:upgrade` in `pre_switch_commands` with
-`deployment/blue_green/enabled` so a failed upgrade never switches traffic.
+Deputy does not touch the database on rollback; take a database backup before major upgrades.
+Run `setup:upgrade` in `pre_switch_commands` (with `deployment/blue_green/enabled`) so a failed upgrade
+never switches traffic.
 
 Each node deploys independently; only the leader runs commands. The health check goes to `default_domain`,
 which behind a load balancer may answer from another node.
