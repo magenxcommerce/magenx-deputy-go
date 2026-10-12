@@ -22,9 +22,20 @@ deploy:
   s3_use_path_style: true
   leader_env_var: IS_LEADER
   leader_default: true
+  # Leader only. {release_dir} = shell-quoted path of the release the command runs for (also $RELEASE_DIR).
+  # Before switch, in the new release; old release keeps serving.
+  # setup:upgrade here needs deployment.blue_green.enabled in env.php and env.php in the release (shared link).
+  pre_switch_commands:
+    - cd {release_dir} && bin/magento setup:db:status >/dev/null 2>&1 || bin/magento setup:upgrade --keep-generated
+  # After switch, in the new release.
   leader_commands:
-    - cd /home/mystore/public/current && bin/magento setup:db:status >/dev/null 2>&1 || bin/magento setup:upgrade --keep-generated
-    - cd /home/mystore/public/current && cacheflush
+    - cd {release_dir} && cacheflush
+  # After a failed post-switch step switched back, in the previous release.
+  rollback_commands:
+    - cd {release_dir} && cacheflush
+  rollback_timeout_seconds: 300
+  # Release dirs kept after a successful deploy (new and previous are always kept); -1 disables pruning.
+  keep_releases: 5
 
 health_check:
   enabled: true
@@ -33,6 +44,8 @@ health_check:
   expected_status: 200
   timeout_seconds: 20
   user_agent_prefix: Deployment health check
+  attempts: 3
+  retry_interval_seconds: 5
 
 shared_links:
   - source: /var/export
@@ -47,3 +60,5 @@ shared_links:
     target: var/importexport
   - source: /pub/media
     target: pub/media
+#  - source: /home/mystore/shared/app/etc/env.php
+#    target: app/etc/env.php

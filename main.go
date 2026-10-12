@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,15 +63,24 @@ type DeployConfig struct {
 	LeaderEnvVar       string   `json:"leader_env_var" yaml:"leader_env_var"`
 	LeaderDefault      bool     `json:"leader_default" yaml:"leader_default"`
 	LeaderCommands     []string `json:"leader_commands" yaml:"leader_commands"`
+	// PreSwitchCommands run on the leader inside the new release before the current symlink switches.
+	PreSwitchCommands []string `json:"pre_switch_commands" yaml:"pre_switch_commands"`
+	// RollbackCommands run on the leader after the current symlink was switched back to the previous release.
+	RollbackCommands       []string `json:"rollback_commands" yaml:"rollback_commands"`
+	RollbackTimeoutSeconds int64    `json:"rollback_timeout_seconds" yaml:"rollback_timeout_seconds"`
+	// KeepReleases is the number of release directories kept after a successful deploy. Negative disables pruning.
+	KeepReleases int `json:"keep_releases" yaml:"keep_releases"`
 }
 
 type HealthCheck struct {
-	Enabled         bool   `json:"enabled" yaml:"enabled"`
-	Scheme          string `json:"scheme" yaml:"scheme"`
-	PathTemplate    string `json:"path_template" yaml:"path_template"`
-	ExpectedStatus  int    `json:"expected_status" yaml:"expected_status"`
-	TimeoutSeconds  int64  `json:"timeout_seconds" yaml:"timeout_seconds"`
-	UserAgentPrefix string `json:"user_agent_prefix" yaml:"user_agent_prefix"`
+	Enabled              bool   `json:"enabled" yaml:"enabled"`
+	Scheme               string `json:"scheme" yaml:"scheme"`
+	PathTemplate         string `json:"path_template" yaml:"path_template"`
+	ExpectedStatus       int    `json:"expected_status" yaml:"expected_status"`
+	TimeoutSeconds       int64  `json:"timeout_seconds" yaml:"timeout_seconds"`
+	UserAgentPrefix      string `json:"user_agent_prefix" yaml:"user_agent_prefix"`
+	Attempts             int    `json:"attempts" yaml:"attempts"`
+	RetryIntervalSeconds int64  `json:"retry_interval_seconds" yaml:"retry_interval_seconds"`
 }
 
 type SharedTarget struct {
@@ -187,6 +197,12 @@ func (c *Config) applyDefaults() {
 	if c.Deploy.LeaderEnvVar == "" {
 		c.Deploy.LeaderEnvVar = "IS_LEADER"
 	}
+	if c.Deploy.RollbackTimeoutSeconds <= 0 {
+		c.Deploy.RollbackTimeoutSeconds = 300
+	}
+	if c.Deploy.KeepReleases == 0 {
+		c.Deploy.KeepReleases = 5
+	}
 	if c.HealthCheck.Scheme == "" {
 		c.HealthCheck.Scheme = "https"
 	}
@@ -201,6 +217,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.HealthCheck.UserAgentPrefix == "" {
 		c.HealthCheck.UserAgentPrefix = "Deployment health check"
+	}
+	if c.HealthCheck.Attempts <= 0 {
+		c.HealthCheck.Attempts = 3
+	}
+	if c.HealthCheck.RetryIntervalSeconds <= 0 {
+		c.HealthCheck.RetryIntervalSeconds = 5
 	}
 }
 
@@ -287,7 +309,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.DeploymentTimeoutSeconds)*time.Second)
+	// Detached from the request: a dropped client connection must not kill bin/magento mid-run.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Duration(s.cfg.DeploymentTimeoutSeconds)*time.Second)
 	defer cancel()
 
 	if err := s.deployer.Deploy(ctx, payload); err != nil {
@@ -317,41 +340,45 @@ func validateSignature(key string, payload []byte, signature string) bool {
 
 type S3MagentoDeployer struct {
 	cfg Config
+	// download fetches the artifact to destination and returns its digest; nil uses S3.
+	download func(ctx context.Context, brand, artifact, destination string) (string, error)
 }
 
 func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
 	artifactFile := filepath.Base(payload.ArtifactName)
 	releaseVersion := normalizeReleaseVersion(artifactFile)
-	deployDir := filepath.Join(d.cfg.Deploy.RootDir, payload.Brand)
+	// absolute: symlink targets must not depend on the service working directory
+	deployDir, err := filepath.Abs(filepath.Join(d.cfg.Deploy.RootDir, payload.Brand))
+	if err != nil {
+		return fmt.Errorf("resolve deploy dir: %w", err)
+	}
 	releasesDir := filepath.Join(deployDir, d.cfg.Deploy.ReleasesDirName)
-	releaseDir := filepath.Join(releasesDir, releaseVersion)
 	currentLink := filepath.Join(deployDir, filepath.FromSlash(d.cfg.Deploy.CurrentLinkSuffix))
+
+	log.Printf("deploy %s: start (brand=%s)", releaseVersion, payload.Brand)
+	defer func() {
+		if err != nil {
+			log.Printf("deploy %s: failed: %v", releaseVersion, err)
+		}
+	}()
 
 	if err := ensureDiskSpace(deployDir, d.cfg.Deploy.MinimumDiskSpaceGB); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(releaseDir, 0o750); err != nil {
-		return fmt.Errorf("create release dir: %w", err)
-	}
 
-	artifactPath := filepath.Join(releaseDir, artifactFile)
-	actualDigest, err := d.downloadArtifact(ctx, payload.Brand, artifactFile, artifactPath)
+	releaseDir, err := d.prepareRelease(ctx, payload, releasesDir, releaseVersion)
 	if err != nil {
 		return err
 	}
-	if err := verifyArtifactDigest(payload.ArtifactDigest, actualDigest); err != nil {
-		_ = os.Remove(artifactPath)
-		return err
-	}
-	if err := extractArtifact(ctx, artifactPath, releaseDir); err != nil {
-		return err
-	}
-	if err := os.Remove(artifactPath); err != nil {
-		return fmt.Errorf("remove downloaded artifact: %w", err)
-	}
 
-	if err := linkSharedPaths(releaseDir, d.cfg.SharedLinks); err != nil {
-		return err
+	// Pre-switch: the old release keeps serving (e.g. setup:upgrade with deployment/blue_green enabled).
+	if d.isLeader() {
+		for _, command := range d.cfg.Deploy.PreSwitchCommands {
+			if err := runShellCommand(ctx, command, releaseDir); err != nil {
+				_ = os.RemoveAll(releaseDir)
+				return fmt.Errorf("pre-switch command failed: %w", err)
+			}
+		}
 	}
 
 	previousRelease, _ := os.Readlink(currentLink)
@@ -360,21 +387,18 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		if err == nil || !switched {
 			return
 		}
-		if previousRelease == "" {
-			_ = os.Remove(currentLink)
-			return
-		}
-		_ = forceSymlink(previousRelease, currentLink)
+		err = errors.Join(err, d.rollback(previousRelease, currentLink))
 	}()
 
 	if err := forceSymlink(releaseDir, currentLink); err != nil {
 		return err
 	}
 	switched = true
+	log.Printf("deploy %s: switched %s -> %s", releaseVersion, currentLink, releaseDir)
 
 	if d.isLeader() {
 		for _, command := range d.cfg.Deploy.LeaderCommands {
-			if err := runCommand(ctx, "/bin/sh", "-c", command); err != nil {
+			if err := runShellCommand(ctx, command, releaseDir); err != nil {
 				return fmt.Errorf("leader command failed: %w", err)
 			}
 		}
@@ -386,7 +410,166 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		}
 	}
 
+	log.Printf("deploy %s: success", releaseVersion)
+	if err := pruneReleases(releasesDir, d.cfg.Deploy.KeepReleases, releaseDir, previousRelease); err != nil {
+		log.Printf("deploy %s: prune releases: %v", releaseVersion, err)
+	}
 	return nil
+}
+
+// prepareRelease downloads, verifies and extracts the artifact into a staging directory, then renames it
+// to a release directory that did not exist before. An existing (possibly live) release is never touched.
+// On error nothing is left behind.
+func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPayload, releasesDir, releaseVersion string) (releaseDir string, err error) {
+	if err := os.MkdirAll(releasesDir, 0o750); err != nil {
+		return "", fmt.Errorf("create releases dir: %w", err)
+	}
+	stagingDir, err := os.MkdirTemp(releasesDir, "."+releaseVersion+".tmp-")
+	if err != nil {
+		return "", fmt.Errorf("create staging dir: %w", err)
+	}
+	if err := os.Chmod(stagingDir, 0o750); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", fmt.Errorf("chmod staging dir: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(stagingDir)
+			if releaseDir != "" {
+				_ = os.RemoveAll(releaseDir)
+			}
+			releaseDir = ""
+		}
+	}()
+
+	artifactFile := filepath.Base(payload.ArtifactName)
+	artifactPath := filepath.Join(stagingDir, artifactFile)
+	download := d.download
+	if download == nil {
+		download = d.downloadArtifact
+	}
+	actualDigest, err := download(ctx, payload.Brand, artifactFile, artifactPath)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyArtifactDigest(payload.ArtifactDigest, actualDigest); err != nil {
+		return "", err
+	}
+	if err := extractArtifact(ctx, artifactPath, stagingDir); err != nil {
+		return "", err
+	}
+	if err := os.Remove(artifactPath); err != nil {
+		return "", fmt.Errorf("remove downloaded artifact: %w", err)
+	}
+
+	target := uniqueReleaseDir(releasesDir, releaseVersion, time.Now())
+	if err := os.Rename(stagingDir, target); err != nil {
+		return "", fmt.Errorf("move release into place: %w", err)
+	}
+	releaseDir = target
+
+	if err := linkSharedPaths(releaseDir, d.cfg.SharedLinks); err != nil {
+		return "", err
+	}
+	return releaseDir, nil
+}
+
+// rollback points the current symlink back to the previous release and runs rollback commands on the leader.
+func (d *S3MagentoDeployer) rollback(previousRelease, currentLink string) error {
+	if previousRelease == "" {
+		if err := os.Remove(currentLink); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("rollback: remove %s failed: %v", currentLink, err)
+			return fmt.Errorf("rollback: remove current link: %w", err)
+		}
+		log.Printf("rollback: removed %s (no previous release)", currentLink)
+		return nil
+	}
+	if err := forceSymlink(previousRelease, currentLink); err != nil {
+		log.Printf("rollback: switch %s -> %s failed: %v", currentLink, previousRelease, err)
+		return fmt.Errorf("rollback: switch to previous release: %w", err)
+	}
+	log.Printf("rollback: switched %s -> %s", currentLink, previousRelease)
+
+	if !d.isLeader() || len(d.cfg.Deploy.RollbackCommands) == 0 {
+		return nil
+	}
+	// fresh context: the deploy context may already be expired
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(d.cfg.Deploy.RollbackTimeoutSeconds)*time.Second)
+	defer cancel()
+	var errs []error
+	for _, command := range d.cfg.Deploy.RollbackCommands {
+		if err := runShellCommand(ctx, command, previousRelease); err != nil {
+			log.Printf("rollback: command failed: %v", err)
+			errs = append(errs, fmt.Errorf("rollback command failed: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// uniqueReleaseDir returns releases/<version>, or releases/<version>-<UTC timestamp> when that already exists.
+func uniqueReleaseDir(releasesDir, version string, now time.Time) string {
+	dir := filepath.Join(releasesDir, version)
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return dir
+	}
+	return filepath.Join(releasesDir, version+"-"+now.UTC().Format("20060102150405"))
+}
+
+// pruneReleases removes the oldest release directories beyond keep, plus leftover staging directories.
+// Protected paths (new and previous release) are never removed. keep < 0 disables pruning.
+func pruneReleases(releasesDir string, keep int, protected ...string) error {
+	if keep < 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return err
+	}
+	isProtected := func(path string) bool {
+		for _, p := range protected {
+			if p != "" && filepath.Clean(p) == filepath.Clean(path) {
+				return true
+			}
+		}
+		return false
+	}
+
+	type release struct {
+		path    string
+		modTime time.Time
+	}
+	var releases []release
+	var errs []error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(releasesDir, entry.Name())
+		if strings.HasPrefix(entry.Name(), ".") {
+			if strings.Contains(entry.Name(), ".tmp-") {
+				errs = append(errs, os.RemoveAll(path))
+			}
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		releases = append(releases, release{path: path, modTime: info.ModTime()})
+	}
+	sort.Slice(releases, func(i, j int) bool { return releases[i].modTime.After(releases[j].modTime) })
+
+	kept := 0
+	for _, r := range releases {
+		if isProtected(r.path) || kept < keep {
+			kept++
+			continue
+		}
+		log.Printf("prune: removing old release %s", r.path)
+		errs = append(errs, os.RemoveAll(r.path))
+	}
+	return errors.Join(errs...)
 }
 
 func (d *S3MagentoDeployer) isLeader() bool {
@@ -397,10 +580,30 @@ func (d *S3MagentoDeployer) isLeader() bool {
 	return value == "1" || value == "true" || value == "yes"
 }
 
+// healthCheck retries up to HealthCheck.Attempts times, waiting RetryIntervalSeconds between attempts.
 func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVersion string) error {
 	if domain == "" {
 		return errors.New("domain is required for health check")
 	}
+	var err error
+	for attempt := 1; attempt <= d.cfg.HealthCheck.Attempts; attempt++ {
+		if err = d.healthCheckOnce(ctx, domain, releaseVersion); err == nil {
+			return nil
+		}
+		log.Printf("deploy %s: health check attempt %d/%d: %v", releaseVersion, attempt, d.cfg.HealthCheck.Attempts, err)
+		if attempt == d.cfg.HealthCheck.Attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		case <-time.After(time.Duration(d.cfg.HealthCheck.RetryIntervalSeconds) * time.Second):
+		}
+	}
+	return err
+}
+
+func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, domain, releaseVersion string) error {
 	path := fmt.Sprintf(d.cfg.HealthCheck.PathTemplate, url.QueryEscape(releaseVersion))
 	checkURL := fmt.Sprintf("%s://%s%s", d.cfg.HealthCheck.Scheme, domain, path)
 
@@ -565,8 +768,26 @@ func linkSharedPaths(releaseDir string, links []SharedTarget) error {
 	return nil
 }
 
+// runShellCommand runs command with /bin/sh. {release_dir} is replaced by the shell-quoted release path,
+// which is also exported as RELEASE_DIR.
+func runShellCommand(ctx context.Context, command, releaseDir string) error {
+	expanded := strings.ReplaceAll(command, "{release_dir}", shellQuote(releaseDir))
+	return runCommandEnv(ctx, []string{"RELEASE_DIR=" + releaseDir}, "/bin/sh", "-c", expanded)
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func runCommand(ctx context.Context, name string, args ...string) error {
+	return runCommandEnv(ctx, nil, name, args...)
+}
+
+func runCommandEnv(ctx context.Context, env []string, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if len(output) == 0 {
