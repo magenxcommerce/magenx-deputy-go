@@ -4,6 +4,8 @@ webhook_secret: YOUR_WEBHOOK_SECRET_HERE
 hmac_key: YOUR_HMAC_KEY_HERE
 timestamp_window_seconds: 300
 deployment_timeout_seconds: 900
+# artifact_digest (sha256:<hex>) is required in the payload; set true only for senders that cannot provide it
+allow_missing_artifact_digest: false
 
 deploy:
   root_dir: /home
