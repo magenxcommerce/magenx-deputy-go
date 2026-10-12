@@ -1,0 +1,47 @@
+listen_addr: 0.0.0.0:8082
+webhook_path: /deploy
+webhook_secret: YOUR_WEBHOOK_SECRET_HERE
+hmac_key: YOUR_HMAC_KEY_HERE
+timestamp_window_seconds: 300
+deployment_timeout_seconds: 900
+
+deploy:
+  root_dir: /home
+  releases_dir_name: releases
+  current_link_suffix: public/current
+  default_brand: mystore
+  default_domain: shop.example.com
+  minimum_disk_space_gb: 10
+  s3_bucket: mystore
+  s3_bucket_per_brand: true
+  s3_prefix: releases
+  s3_endpoint: https://s3.example.com
+  s3_region: us-east-1
+  s3_use_path_style: true
+  leader_env_var: IS_LEADER
+  leader_default: true
+  leader_commands:
+    - cd /home/mystore/public/current && bin/magento setup:db:status >/dev/null 2>&1 || bin/magento setup:upgrade --keep-generated
+    - cd /home/mystore/public/current && cacheflush
+
+health_check:
+  enabled: true
+  scheme: https
+  path_template: /health_check.php?release=%s
+  expected_status: 200
+  timeout_seconds: 20
+  user_agent_prefix: Deployment health check
+
+shared_links:
+  - source: /var/export
+    target: var/export
+  - source: /var/report
+    target: var/report
+  - source: /var/import
+    target: var/import
+  - source: /var/import_history
+    target: var/import_history
+  - source: /var/importexport
+    target: var/importexport
+  - source: /pub/media
+    target: pub/media

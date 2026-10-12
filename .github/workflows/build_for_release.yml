@@ -1,0 +1,133 @@
+name: Build Go App for Release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "Tag to build"
+        required: true
+        type: string
+      sha:
+        description: "Commit SHA to checkout"
+        required: true
+        type: string
+      prerelease:
+        description: "Release type - prerelease or release"
+        required: true
+        type: boolean
+    secrets:
+      DEPUTY_TOKEN:
+        required: true
+
+concurrency:
+  group: build-${{ inputs.tag_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    name: Build Go Binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code at release sha
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run all tests
+        id: test
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Build go binary
+        id: build
+        shell: bash
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          
+          VERSION="${{ inputs.tag_name }}"
+          
+          targets=(
+            "linux amd64"
+            "linux arm64"
+          )
+          
+          for target in "${targets[@]}"; do
+            read -r GOOS GOARCH <<<"${target}"
+          
+            BINARY_NAME_ARCH="${{ github.event.repository.name }}-${GOOS}-${GOARCH}"
+            
+            echo "==> Building ${BINARY_NAME_ARCH} (GOOS=${GOOS} GOARCH=${GOARCH}) version=${VERSION}"
+            GOOS="${GOOS}" GOARCH="${GOARCH}" \
+            go build -ldflags "-X github.com/magenxcommerce/magenx-deputy-go/version.Version=${VERSION} -s -w" \
+            -o "${BINARY_NAME_ARCH}" .
+          
+            if [ ! -f "${BINARY_NAME_ARCH}" ]; then
+              echo "Error: Build failed. Binary not found!"
+              exit 1
+            fi
+            echo "${GOARCH}_checksum=$(sha256sum ${BINARY_NAME_ARCH})" >> ${GITHUB_OUTPUT}
+          done
+
+      - name: Append release body and upload all assets
+        env:
+          GH_TOKEN: ${{ secrets.DEPUTY_TOKEN }}
+        run: |
+          # Get current release body
+          CURRENT_BODY=$(gh release view "${{ inputs.tag_name }}" --repo "${{ github.repository }}" --json body -q .body)
+          
+          # New content to append
+          NEW_BODY='<details>
+            <summary>Installation for <strong>Linux (amd64)</strong></summary>
+            <pre><code>
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag_name }}/${{ github.event.repository.name }}-linux-amd64
+            if echo "${{ steps.build.outputs.amd64_checksum }}" | sha256sum -c; then
+              echo "Verification passed"
+              chmod +x ${{ github.event.repository.name }}-linux-amd64
+              mv ${{ github.event.repository.name }}-linux-amd64 /usr/local/sbin/${{ github.event.repository.name }}
+              ${{ github.event.repository.name }} version
+            else
+              echo "Verification failed"
+            fi
+            </code></pre>
+            </details>
+            <details>
+            <summary>Installation for <strong>Linux (arm64)</strong></summary>
+            <pre><code>
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag_name }}/${{ github.event.repository.name }}-linux-arm64
+            if echo "${{ steps.build.outputs.arm64_checksum }}" | sha256sum -c; then
+              echo "Verification passed"
+              chmod +x ${{ github.event.repository.name }}-linux-arm64
+              mv ${{ github.event.repository.name }}-linux-arm64 /usr/local/sbin/${{ github.event.repository.name }}
+              ${{ github.event.repository.name }} version
+            else
+              echo "Verification failed"
+            fi
+            </code></pre>
+            </details>'
+          
+          # Combine current body with new content
+          FINAL_BODY="${CURRENT_BODY}\\n\\n${NEW_BODY}"
+          
+          # Update release with new body and settings
+          gh release edit "${{ inputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --prerelease=${{ inputs.prerelease }} \
+            --notes="$FINAL_BODY"
+          
+          # Upload all assets
+          gh release upload "${{ inputs.tag_name }}" ${{ github.event.repository.name }}-* \
+            --repo "${{ github.repository }}" \
+            --clobber
