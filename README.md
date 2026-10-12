@@ -68,10 +68,14 @@ JSON payload:
 
 `brand` and `domain` can be omitted when `deploy.default_brand` / `deploy.default_domain` are set.
 
+`artifact_digest` is the sha256 of the release archive in S3, formatted `sha256:<64 hex chars>`.
+It is required unless `allow_missing_artifact_digest: true` is set; a digest that is sent is always verified.
+
 ## Deployment behavior
 
 - validates webhook secret, HMAC signature, and timestamp window
 - downloads artifact from S3 using `github.com/aws/aws-sdk-go-v2/service/s3`
+- verifies the artifact sha256 against `artifact_digest`; on mismatch the archive is deleted and nothing is extracted or switched
 - extracts release into `<root_dir>/<brand>/<releases_dir_name>/<release_version>`
 - mounts configured shared links
 - switches `<root_dir>/<brand>/<current_link_suffix>` symlink to the new release

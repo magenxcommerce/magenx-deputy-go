@@ -33,15 +33,17 @@ import (
 )
 
 type Config struct {
-	ListenAddr               string         `json:"listen_addr" yaml:"listen_addr"`
-	WebhookPath              string         `json:"webhook_path" yaml:"webhook_path"`
-	WebhookSecret            string         `json:"webhook_secret" yaml:"webhook_secret"`
-	HMACKey                  string         `json:"hmac_key" yaml:"hmac_key"`
-	TimestampWindowSeconds   int64          `json:"timestamp_window_seconds" yaml:"timestamp_window_seconds"`
-	DeploymentTimeoutSeconds int64          `json:"deployment_timeout_seconds" yaml:"deployment_timeout_seconds"`
-	Deploy                   DeployConfig   `json:"deploy" yaml:"deploy"`
-	HealthCheck              HealthCheck    `json:"health_check" yaml:"health_check"`
-	SharedLinks              []SharedTarget `json:"shared_links" yaml:"shared_links"`
+	ListenAddr               string `json:"listen_addr" yaml:"listen_addr"`
+	WebhookPath              string `json:"webhook_path" yaml:"webhook_path"`
+	WebhookSecret            string `json:"webhook_secret" yaml:"webhook_secret"`
+	HMACKey                  string `json:"hmac_key" yaml:"hmac_key"`
+	TimestampWindowSeconds   int64  `json:"timestamp_window_seconds" yaml:"timestamp_window_seconds"`
+	DeploymentTimeoutSeconds int64  `json:"deployment_timeout_seconds" yaml:"deployment_timeout_seconds"`
+	// AllowMissingArtifactDigest accepts payloads without artifact_digest. Digests that are sent are always verified.
+	AllowMissingArtifactDigest bool           `json:"allow_missing_artifact_digest" yaml:"allow_missing_artifact_digest"`
+	Deploy                     DeployConfig   `json:"deploy" yaml:"deploy"`
+	HealthCheck                HealthCheck    `json:"health_check" yaml:"health_check"`
+	SharedLinks                []SharedTarget `json:"shared_links" yaml:"shared_links"`
 }
 
 type DeployConfig struct {
@@ -97,6 +99,7 @@ type Server struct {
 var (
 	brandPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 	artifactPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+\.(?:tar\.gz|tgz)$`)
+	digestPattern   = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
 )
 
 func main() {
@@ -272,6 +275,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid brand or artifact_name format", http.StatusBadRequest)
 		return
 	}
+	if payload.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
+		http.Error(w, "artifact_digest is required", http.StatusBadRequest)
+		return
+	}
+	if payload.ArtifactDigest != "" && !digestPattern.MatchString(payload.ArtifactDigest) {
+		http.Error(w, "invalid artifact_digest format, expected sha256:<hex>", http.StatusBadRequest)
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,7 +335,12 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	}
 
 	artifactPath := filepath.Join(releaseDir, artifactFile)
-	if err := d.downloadArtifact(ctx, payload.Brand, artifactFile, artifactPath); err != nil {
+	actualDigest, err := d.downloadArtifact(ctx, payload.Brand, artifactFile, artifactPath)
+	if err != nil {
+		return err
+	}
+	if err := verifyArtifactDigest(payload.ArtifactDigest, actualDigest); err != nil {
+		_ = os.Remove(artifactPath)
 		return err
 	}
 	if err := extractArtifact(ctx, artifactPath, releaseDir); err != nil {
@@ -407,13 +423,14 @@ func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVers
 	return nil
 }
 
-func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifact, destination string) error {
+// downloadArtifact writes the S3 object to destination and returns its sha256 as "sha256:<hex>".
+func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifact, destination string) (string, error) {
 	bucket := d.cfg.Deploy.S3Bucket
 	if d.cfg.Deploy.S3BucketPerBrand {
 		bucket = brand
 	}
 	if bucket == "" {
-		return errors.New("s3 bucket is not configured")
+		return "", errors.New("s3 bucket is not configured")
 	}
 
 	prefix := strings.Trim(d.cfg.Deploy.S3Prefix, "/")
@@ -441,7 +458,7 @@ func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifac
 
 	awsCfg, err := sdkconfig.LoadDefaultConfig(ctx, loadOptions...)
 	if err != nil {
-		return fmt.Errorf("load aws config: %w", err)
+		return "", fmt.Errorf("load aws config: %w", err)
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -453,18 +470,41 @@ func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifac
 		Key:    awsv2.String(artifactPath),
 	})
 	if err != nil {
-		return fmt.Errorf("download artifact %s: %w", s3URI, err)
+		return "", fmt.Errorf("download artifact %s: %w", s3URI, err)
 	}
 	defer obj.Body.Close()
 
 	out, err := os.Create(destination)
 	if err != nil {
-		return fmt.Errorf("create local artifact file: %w", err)
+		return "", fmt.Errorf("create local artifact file: %w", err)
 	}
-	defer out.Close()
+	digest, err := copyWithSHA256(out, obj.Body)
+	if closeErr := out.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", fmt.Errorf("write downloaded artifact: %w", err)
+	}
+	return digest, nil
+}
 
-	if _, err := io.Copy(out, obj.Body); err != nil {
-		return fmt.Errorf("write downloaded artifact: %w", err)
+// copyWithSHA256 copies src to dst and returns the sha256 of the copied bytes as "sha256:<hex>".
+func copyWithSHA256(dst io.Writer, src io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(dst, h), src); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// verifyArtifactDigest compares the expected payload digest with the downloaded one.
+// An empty expected digest is accepted; the webhook handler decides whether it is allowed.
+func verifyArtifactDigest(expected, actual string) error {
+	if expected == "" {
+		return nil
+	}
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("artifact digest mismatch: expected %s, got %s", strings.ToLower(expected), actual)
 	}
 	return nil
 }
