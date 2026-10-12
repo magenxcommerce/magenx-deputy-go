@@ -1,0 +1,6 @@
+# Build output
+magenx-deputy-go
+*.exe
+
+# Local config (contains secrets)
+config.yaml
