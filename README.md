@@ -73,12 +73,37 @@ It is required unless `allow_missing_artifact_digest: true` is set; a digest tha
 
 ## Deployment behavior
 
-- validates webhook secret, HMAC signature, and timestamp window
-- downloads artifact from S3 using `github.com/aws/aws-sdk-go-v2/service/s3`
-- verifies the artifact sha256 against `artifact_digest`; on mismatch the archive is deleted and nothing is extracted or switched
-- extracts release into `<root_dir>/<brand>/<releases_dir_name>/<release_version>`
-- mounts configured shared links
-- switches `<root_dir>/<brand>/<current_link_suffix>` symlink to the new release
-- runs leader commands when `IS_LEADER` (or configured env var) resolves true
-- runs configurable health check
-- rolls back the symlink if post-switch steps fail
+1. validates webhook secret, HMAC signature, timestamp window and `artifact_digest`
+2. checks free disk space
+3. downloads the artifact from S3 into a staging dir `<releases_dir>/.<version>.tmp-*`, verifies sha256, extracts
+4. renames staging to `<root_dir>/<brand>/<releases_dir_name>/<release_version>`; if that dir exists
+   (redeploy of the same version) a new `<release_version>-<UTC timestamp>` dir is used, so the live
+   release is never modified
+5. mounts configured shared links
+6. leader: runs `pre_switch_commands` in the new release while the old one keeps serving
+7. switches `<root_dir>/<brand>/<current_link_suffix>` symlink atomically
+8. leader: runs `leader_commands`
+9. runs the health check (`attempts`, `retry_interval_seconds`)
+10. prunes releases beyond `keep_releases` (never the new or previous one) and leftover staging dirs
+
+Commands run with `/bin/sh -c` as the service user; `{release_dir}` is replaced by the shell-quoted
+release path and exported as `RELEASE_DIR`. The deploy runs to completion (or `deployment_timeout_seconds`)
+even if the webhook client disconnects. The webhook answers after the deploy finished: `200 ok` or `500`
+with the error.
+
+## Failure handling
+
+| Failure in | Result |
+|---|---|
+| disk check, download, digest, extract, shared links | staging/new dir removed, `current` untouched |
+| `pre_switch_commands` | new dir removed, `current` untouched. Database changes already made by the command are **not** reverted |
+| `leader_commands`, health check | `current` switched back to the previous release (removed on first deploy), `rollback_commands` run in the previous release; rollback errors are added to the response |
+
+Database migrations are never rolled back. Keep schema changes backward compatible so the previous release
+still runs on the upgraded database, and run `setup:upgrade` in `pre_switch_commands` with
+`deployment/blue_green/enabled` so a failed upgrade never switches traffic.
+
+Each node deploys independently; only the leader runs commands. The health check goes to `default_domain`,
+which behind a load balancer may answer from another node.
+
+All steps, failures and rollbacks are logged (`journalctl -u magenx-deputy-go`).
