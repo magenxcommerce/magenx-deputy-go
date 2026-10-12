@@ -28,6 +28,8 @@ import (
 	sdkconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"gopkg.in/yaml.v3"
+
+	"github.com/magenxcommerce/magenx-deputy-go/version"
 )
 
 type Config struct {
@@ -98,6 +100,11 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Printf("magenx-deputy-go %s\n", version.Version)
+		os.Exit(0)
+	}
+
 	configPath := flag.String("config", "config.yaml", "Path to config YAML file")
 	flag.Parse()
 

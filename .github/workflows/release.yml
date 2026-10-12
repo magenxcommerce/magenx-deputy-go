@@ -1,0 +1,144 @@
+name: Pre-release and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.github/**'
+      - 'config.example.yaml'
+      - 'README.md'
+      - 'CODE_OF_CONDUCT.md'
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  PRERELEASE_CONFIG: ".github/release/prerelease-config.json"
+  PRERELEASE_MANIFEST: ".github/release/prerelease-manifest.json"
+  RELEASE_CONFIG: ".github/release/config.json"
+  RELEASE_MANIFEST: ".github/release/manifest.json"
+
+concurrency:
+  group: release
+
+jobs:
+  pre_release:
+    name: Create pre-release PR + draft prerelease
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.pre_release.outputs.releases_created }}
+      tag_name: ${{ steps.pre_release.outputs.tag_name }}
+      prs_created: ${{ steps.pre_release.outputs.prs_created }}
+      pr: ${{ steps.pre_release.outputs.pr }}
+      upload_url: ${{ steps.pre_release.outputs.upload_url }}
+      version: ${{ steps.pre_release.outputs.version }}
+      sha: ${{ steps.pre_release.outputs.sha }}
+    steps:
+      - name: Create pre-release
+        id: pre_release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          token: ${{ secrets.DEPUTY_TOKEN }}
+          config-file: ${{ env.PRERELEASE_CONFIG }}
+          manifest-file: ${{ env.PRERELEASE_MANIFEST }}
+
+  codeql_security_scan:
+    needs: pre_release
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    uses: ./.github/workflows/codeql-security-scan.yml
+    with:
+      sha: ${{ needs.pre_release.outputs.sha }}
+    permissions: 
+      security-events: write
+
+  build_prerelease:
+    name: Build & upload artifacts to prerelease draft
+    needs: [pre_release, codeql_security_scan]
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    uses: ./.github/workflows/build_for_release.yml
+    with:
+      tag_name: ${{ needs.pre_release.outputs.tag_name }}
+      sha: ${{ needs.pre_release.outputs.sha }}
+      prerelease: true
+    secrets:
+      DEPUTY_TOKEN: ${{ secrets.DEPUTY_TOKEN }}
+
+  publish_prerelease:
+    name: Publish pre-release (draft -> published)
+    needs: [pre_release, build_prerelease]
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark pre-release as published
+        env:
+          GH_TOKEN: ${{ secrets.DEPUTY_TOKEN }}
+        run: |
+          gh release edit "${{ needs.pre_release.outputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --prerelease
+
+  release:
+    name: Create release PR + draft stable release
+    needs: pre_release
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Create release PR
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          token: ${{ secrets.DEPUTY_TOKEN }}
+          config-file: ${{ env.RELEASE_CONFIG }}
+          manifest-file: ${{ env.RELEASE_MANIFEST }}
+
+  osv_scan:
+    name: Google osv-scanner
+    needs: pre_release
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && !contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+    with:
+      scan-args: |-
+        ./
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+  build_release:
+    name: Build & upload artifacts to stable release draft
+    needs: pre_release
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' && !contains(needs.pre_release.outputs.tag_name, '-rc') }}
+    uses: ./.github/workflows/build_for_release.yml
+    with:
+      tag_name: ${{ needs.pre_release.outputs.tag_name }}
+      sha: ${{ needs.pre_release.outputs.sha }}
+      prerelease: false
+    secrets:
+      DEPUTY_TOKEN: ${{ secrets.DEPUTY_TOKEN }}
+
+  publish_release:
+    name: Publish stable release (draft -> published)
+    needs: [pre_release, build_release]
+    if: ${{ needs.pre_release.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark stable release as published
+        env:
+          GH_TOKEN: ${{ secrets.DEPUTY_TOKEN }}
+        run: |
+          gh release edit "${{ needs.pre_release.outputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --prerelease=false

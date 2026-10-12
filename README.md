@@ -15,6 +15,12 @@ cp config.example.yaml config.yaml
 ./magenx-deputy-go -config config.yaml
 ```
 
+Print build version:
+
+```bash
+./magenx-deputy-go version
+```
+
 ## Webhook contract
 
 The service expects:
