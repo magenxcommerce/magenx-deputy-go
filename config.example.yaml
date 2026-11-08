@@ -91,8 +91,9 @@ stack:
   lock_asset: docker-compose.release.yml
   # relative to the release; server-only files come in through shared_links
   env_files: [.env, .env.secrets]
+  # .env.secrets stays where docker.sh created it, next to the clone the server scripts run from
   shared_links:
-    - source: /opt/mystore/shared/.env.secrets
+    - source: /opt/mystore/docker/.env.secrets
       target: .env.secrets
   # Trust anchor, never taken from the downloaded release. Copy cosign/cosign.pub of the repository here.
   cosign_public_key: /etc/magenx-deputy-go/cosign.pub

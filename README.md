@@ -158,8 +158,8 @@ Setup on the server:
    once as the `stack.run_as` user.
 2. Copy `cosign/cosign.pub` of the repository to `stack.cosign_public_key`. Deputy never trusts the key in the
    downloaded release: who can push to the repository could replace it.
-3. Move server-only files (`.env.secrets`, host overrides) to e.g. `/opt/<brand>/shared/` and list them in
-   `stack.shared_links`; `stack.env_files` are passed to compose as `--env-file`.
+3. List server-only files in `stack.shared_links`, e.g. `/opt/<brand>/docker/.env.secrets` where `docker.sh`
+   created it; each release links to it. `stack.env_files` are passed to compose as `--env-file`.
 4. Add `stack.dir` to `ReadWritePaths=` and enable `stack` in the config.
 
 Deployment behavior:
