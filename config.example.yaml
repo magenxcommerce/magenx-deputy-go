@@ -36,6 +36,15 @@ deploy:
   rollback_timeout_seconds: 300
   # Release dirs kept after a successful deploy (new and previous are always kept); -1 disables pruning.
   keep_releases: 5
+  # User that owns the releases and runs the commands: "user", "user:group", "uid" or "uid:gid".
+  # Empty = the deputy process user. Deputy must run as root to use another user.
+  # Docker host with userns-remap: the host uid of the container user, e.g. "165532:165532".
+  run_as: mystore
+  # Commands get a clean environment (HOME, USER, LOGNAME, PATH) plus these:
+  # KEY=VALUE, or NAME to pass deputy's own value of NAME. S3 keys and the GitHub token are never passed.
+  command_env: []
+  # Commands as root (run_as root, or no run_as while deputy runs as root) are refused unless true.
+  allow_root_commands: false
 
 health_check:
   enabled: true
@@ -62,3 +71,57 @@ shared_links:
     target: pub/media
 #  - source: /home/mystore/shared/app/etc/env.php
 #    target: app/etc/env.php
+
+# Docker stack releases from GitHub: the repository at the release tag plus the
+# docker-compose.release.yml asset that pins every image by digest.
+# Webhook payload: {"kind": "stack", "tag": "v1.11.0", "confirm": ["mariadb"]}
+stack:
+  enabled: false
+  repo: magenxcommerce/magenxcommerce-docker
+  # GitHub token from /etc/magenx-deputy-go/env, never in this file.
+  # Classic PAT: read:packages (ghcr.io pulls), plus repo for a private repository.
+  token_env: GITHUB_TOKEN
+  # Set to run "docker login ghcr.io" with the token before pulling; empty = run_as user is already logged in.
+  registry: ghcr.io
+  registry_username: ""
+  # releases/<tag> and the current symlink
+  dir: /opt/mystore/stack
+  project_name: mystore
+  compose_files: [docker-compose.yml]
+  lock_asset: docker-compose.release.yml
+  # relative to the release; server-only files come in through shared_links
+  env_files: [.env, .env.secrets]
+  # .env.secrets stays where docker.sh created it, next to the clone the server scripts run from
+  shared_links:
+    - source: /opt/mystore/docker/.env.secrets
+      target: .env.secrets
+  # Trust anchor, never taken from the downloaded release. Copy cosign/cosign.pub of the repository here.
+  cosign_public_key: /etc/magenx-deputy-go/cosign.pub
+  cosign_args: ["--insecure-ignore-tlog=true"]
+  require_sbom: false
+  allow_prerelease: false
+  require_immutable: false
+  # empty = every service minus exclude_services, services of profiles not listed in profiles are skipped
+  services: []
+  exclude_services: [magento]
+  profiles: []
+  remove_orphans: false
+  # An image change of these services needs "confirm": ["<service>"] in the webhook: their data
+  # cannot be rolled back by switching images. Polling never confirms.
+  confirm_services: [mariadb, opensearch]
+  # /bin/sh in a release dir, {release_dir} and $RELEASE_DIR as in deploy commands
+  pre_up_commands: []
+  post_up_commands: []
+  rollback_commands: []
+  # checked after "up" with health_check attempts, timeout and expected_status
+  health_check_url: ""
+  wait_timeout_seconds: 600
+  deployment_timeout_seconds: 1800
+  rollback_timeout_seconds: 900
+  minimum_disk_space_gb: 5
+  keep_releases: 3
+  # > 0: also deploy the latest release (no draft, no prerelease) on this interval
+  poll_interval_seconds: 0
+  # Runs docker, cosign, tar and the commands. Needs the docker socket: root or a member of group docker.
+  run_as: ""
+  command_env: []

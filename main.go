@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -45,6 +44,7 @@ type Config struct {
 	Deploy                     DeployConfig   `json:"deploy" yaml:"deploy"`
 	HealthCheck                HealthCheck    `json:"health_check" yaml:"health_check"`
 	SharedLinks                []SharedTarget `json:"shared_links" yaml:"shared_links"`
+	Stack                      StackConfig    `json:"stack" yaml:"stack"`
 }
 
 type DeployConfig struct {
@@ -70,6 +70,14 @@ type DeployConfig struct {
 	RollbackTimeoutSeconds int64    `json:"rollback_timeout_seconds" yaml:"rollback_timeout_seconds"`
 	// KeepReleases is the number of release directories kept after a successful deploy. Negative disables pruning.
 	KeepReleases int `json:"keep_releases" yaml:"keep_releases"`
+	// RunAs is the user ("user", "user:group", "uid", "uid:gid") that owns the releases and runs the commands.
+	// Empty is the deputy process user. Another user needs deputy to run as root.
+	RunAs string `json:"run_as" yaml:"run_as"`
+	// CommandEnv is passed to commands: KEY=VALUE, or NAME to pass deputy's own value of NAME.
+	// Commands do not inherit the deputy environment.
+	CommandEnv []string `json:"command_env" yaml:"command_env"`
+	// AllowRootCommands permits commands to run as root (run_as root, or empty while deputy runs as root).
+	AllowRootCommands bool `json:"allow_root_commands" yaml:"allow_root_commands"`
 }
 
 type HealthCheck struct {
@@ -89,11 +97,17 @@ type SharedTarget struct {
 }
 
 type DeployPayload struct {
+	// Kind selects the deployer: "" or "code" for a Magento release from S3, "stack" for a docker stack release.
+	Kind           string `json:"kind" yaml:"kind"`
 	ArtifactName   string `json:"artifact_name" yaml:"artifact_name"`
 	ArtifactDigest string `json:"artifact_digest" yaml:"artifact_digest"`
 	Brand          string `json:"brand" yaml:"brand"`
 	Domain         string `json:"domain" yaml:"domain"`
 	Timestamp      int64  `json:"timestamp" yaml:"timestamp"`
+	// Tag is the GitHub release of the docker stack repository (kind stack).
+	Tag string `json:"tag" yaml:"tag"`
+	// Confirm lists services listed in stack.confirm_services whose image may change with this release.
+	Confirm []string `json:"confirm" yaml:"confirm"`
 }
 
 type Deployer interface {
@@ -103,7 +117,10 @@ type Deployer interface {
 type Server struct {
 	cfg      Config
 	deployer Deployer
-	mu       sync.Mutex
+	// stack is nil when stack.enabled is false.
+	stack Deployer
+	// mu serializes all deploys, code and stack.
+	mu sync.Mutex
 }
 
 var (
@@ -129,9 +146,35 @@ func main() {
 		log.Fatal("webhook_secret and hmac_key are required")
 	}
 
+	codeID, err := resolveIdentity(cfg.Deploy.RunAs)
+	if err != nil {
+		log.Fatalf("deploy.run_as: %v", err)
+	}
+	if codeID.isRoot() && !cfg.Deploy.AllowRootCommands {
+		log.Fatal("deploy commands would run as root: set deploy.run_as to the site user, or deploy.allow_root_commands: true")
+	}
+	server := &Server{cfg: cfg, deployer: &S3MagentoDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv)}}
+	log.Printf("code deploys run as %s", codeID)
+
+	if cfg.Stack.Enabled {
+		stackID, err := resolveIdentity(cfg.Stack.RunAs)
+		if err != nil {
+			log.Fatalf("stack.run_as: %v", err)
+		}
+		stack := newStackDeployer(cfg, newRunner(stackID, cfg.Stack.CommandEnv))
+		if err := stack.checkTools(); err != nil {
+			log.Fatalf("stack: %v", err)
+		}
+		server.stack = stack
+		log.Printf("stack deploys of %s run as %s", cfg.Stack.Repo, stackID)
+		if cfg.Stack.PollIntervalSeconds > 0 {
+			go server.pollStack(context.Background(), stack, time.Duration(cfg.Stack.PollIntervalSeconds)*time.Second)
+		}
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: &Server{cfg: cfg, deployer: &S3MagentoDeployer{cfg: cfg}},
+		Handler: server,
 	}
 
 	log.Printf("listening on %s%s", cfg.ListenAddr, cfg.WebhookPath)
@@ -224,6 +267,7 @@ func (c *Config) applyDefaults() {
 	if c.HealthCheck.RetryIntervalSeconds <= 0 {
 		c.HealthCheck.RetryIntervalSeconds = 5
 	}
+	c.Stack.applyDefaults(c.Deploy.DefaultBrand)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -273,36 +317,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "timestamp mismatch", http.StatusBadRequest)
 		return
 	}
-	brand, err := requireMatchOrEmpty(payload.Brand, s.cfg.Deploy.DefaultBrand)
-	if err != nil {
-		http.Error(w, "brand does not match configured default", http.StatusBadRequest)
-		return
-	}
-	domain, err := requireMatchOrEmpty(payload.Domain, s.cfg.Deploy.DefaultDomain)
-	if err != nil {
-		http.Error(w, "domain does not match configured default", http.StatusBadRequest)
-		return
-	}
-	payload.Brand = brand
-	payload.Domain = domain
-	if payload.ArtifactName == "" || payload.Brand == "" {
-		http.Error(w, "artifact_name and brand are required", http.StatusBadRequest)
-		return
-	}
-	if s.cfg.HealthCheck.Enabled && payload.Domain == "" {
-		http.Error(w, "domain is required when health_check is enabled", http.StatusBadRequest)
-		return
-	}
-	if !isValidPayloadPathFields(payload.Brand, payload.ArtifactName) {
-		http.Error(w, "invalid brand or artifact_name format", http.StatusBadRequest)
-		return
-	}
-	if payload.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
-		http.Error(w, "artifact_digest is required", http.StatusBadRequest)
-		return
-	}
-	if payload.ArtifactDigest != "" && !digestPattern.MatchString(payload.ArtifactDigest) {
-		http.Error(w, "invalid artifact_digest format, expected sha256:<hex>", http.StatusBadRequest)
+
+	deployer := s.deployer
+	timeout := time.Duration(s.cfg.DeploymentTimeoutSeconds) * time.Second
+	switch payload.Kind {
+	case "", "code":
+		if msg := s.validateCodePayload(&payload); msg != "" {
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+	case "stack":
+		if s.stack == nil {
+			http.Error(w, "stack deploys are not enabled", http.StatusBadRequest)
+			return
+		}
+		if msg := validateStackPayload(payload); msg != "" {
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+		deployer = s.stack
+		timeout = time.Duration(s.cfg.Stack.DeploymentTimeoutSeconds) * time.Second
+	default:
+		http.Error(w, "unknown kind, expected code or stack", http.StatusBadRequest)
 		return
 	}
 
@@ -310,16 +346,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	// Detached from the request: a dropped client connection must not kill bin/magento mid-run.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Duration(s.cfg.DeploymentTimeoutSeconds)*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
 	defer cancel()
 
-	if err := s.deployer.Deploy(ctx, payload); err != nil {
+	if err := deployer.Deploy(ctx, payload); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+// validateCodePayload fills brand and domain from the defaults and returns an error message, or "".
+func (s *Server) validateCodePayload(payload *DeployPayload) string {
+	if payload.Tag != "" || len(payload.Confirm) > 0 {
+		return "tag and confirm are only valid with kind stack"
+	}
+	brand, err := requireMatchOrEmpty(payload.Brand, s.cfg.Deploy.DefaultBrand)
+	if err != nil {
+		return "brand does not match configured default"
+	}
+	domain, err := requireMatchOrEmpty(payload.Domain, s.cfg.Deploy.DefaultDomain)
+	if err != nil {
+		return "domain does not match configured default"
+	}
+	payload.Brand = brand
+	payload.Domain = domain
+	if payload.ArtifactName == "" || payload.Brand == "" {
+		return "artifact_name and brand are required"
+	}
+	if s.cfg.HealthCheck.Enabled && payload.Domain == "" {
+		return "domain is required when health_check is enabled"
+	}
+	if !isValidPayloadPathFields(payload.Brand, payload.ArtifactName) {
+		return "invalid brand or artifact_name format"
+	}
+	if payload.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
+		return "artifact_digest is required"
+	}
+	if payload.ArtifactDigest != "" && !digestPattern.MatchString(payload.ArtifactDigest) {
+		return "invalid artifact_digest format, expected sha256:<hex>"
+	}
+	return ""
 }
 
 func validateSignature(key string, payload []byte, signature string) bool {
@@ -340,6 +409,8 @@ func validateSignature(key string, payload []byte, signature string) bool {
 
 type S3MagentoDeployer struct {
 	cfg Config
+	// run starts commands and tar as deploy.run_as; files deputy creates are handed to that user.
+	run Runner
 	// download fetches the artifact to destination and returns its digest; nil uses S3.
 	download func(ctx context.Context, brand, artifact, destination string) (string, error)
 }
@@ -362,6 +433,9 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		}
 	}()
 
+	if err := d.run.ID.mkdirAll(deployDir, 0o750); err != nil {
+		return fmt.Errorf("create deploy dir: %w", err)
+	}
 	if err := ensureDiskSpace(deployDir, d.cfg.Deploy.MinimumDiskSpaceGB); err != nil {
 		return err
 	}
@@ -374,7 +448,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	// Pre-switch: the old release keeps serving (e.g. setup:upgrade with deployment/blue_green enabled).
 	if d.isLeader() {
 		for _, command := range d.cfg.Deploy.PreSwitchCommands {
-			if err := runShellCommand(ctx, command, releaseDir); err != nil {
+			if err := d.run.Shell(ctx, command, releaseDir); err != nil {
 				_ = os.RemoveAll(releaseDir)
 				return fmt.Errorf("pre-switch command failed: %w", err)
 			}
@@ -382,6 +456,9 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	}
 
 	previousRelease, _ := os.Readlink(currentLink)
+	if previousRelease != "" && !filepath.IsAbs(previousRelease) {
+		previousRelease = filepath.Join(filepath.Dir(currentLink), previousRelease)
+	}
 	switched := false
 	defer func() {
 		if err == nil || !switched {
@@ -390,7 +467,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		err = errors.Join(err, d.rollback(previousRelease, currentLink))
 	}()
 
-	if err := forceSymlink(releaseDir, currentLink); err != nil {
+	if err := d.run.ID.symlink(releaseDir, currentLink); err != nil {
 		return err
 	}
 	switched = true
@@ -398,7 +475,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 
 	if d.isLeader() {
 		for _, command := range d.cfg.Deploy.LeaderCommands {
-			if err := runShellCommand(ctx, command, releaseDir); err != nil {
+			if err := d.run.Shell(ctx, command, releaseDir); err != nil {
 				return fmt.Errorf("leader command failed: %w", err)
 			}
 		}
@@ -421,16 +498,9 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 // to a release directory that did not exist before. An existing (possibly live) release is never touched.
 // On error nothing is left behind.
 func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPayload, releasesDir, releaseVersion string) (releaseDir string, err error) {
-	if err := os.MkdirAll(releasesDir, 0o750); err != nil {
-		return "", fmt.Errorf("create releases dir: %w", err)
-	}
-	stagingDir, err := os.MkdirTemp(releasesDir, "."+releaseVersion+".tmp-")
+	stagingDir, err := makeStagingDir(d.run.ID, releasesDir, releaseVersion)
 	if err != nil {
-		return "", fmt.Errorf("create staging dir: %w", err)
-	}
-	if err := os.Chmod(stagingDir, 0o750); err != nil {
-		_ = os.RemoveAll(stagingDir)
-		return "", fmt.Errorf("chmod staging dir: %w", err)
+		return "", err
 	}
 	defer func() {
 		if err != nil {
@@ -455,7 +525,10 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPa
 	if err := verifyArtifactDigest(payload.ArtifactDigest, actualDigest); err != nil {
 		return "", err
 	}
-	if err := extractArtifact(ctx, artifactPath, stagingDir); err != nil {
+	if err := d.run.ID.own(artifactPath); err != nil {
+		return "", err
+	}
+	if err := extractArchive(ctx, d.run, artifactPath, stagingDir, 0); err != nil {
 		return "", err
 	}
 	if err := os.Remove(artifactPath); err != nil {
@@ -468,7 +541,7 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPa
 	}
 	releaseDir = target
 
-	if err := linkSharedPaths(releaseDir, d.cfg.SharedLinks); err != nil {
+	if err := linkSharedPaths(d.run.ID, releaseDir, d.cfg.SharedLinks); err != nil {
 		return "", err
 	}
 	return releaseDir, nil
@@ -484,7 +557,7 @@ func (d *S3MagentoDeployer) rollback(previousRelease, currentLink string) error 
 		log.Printf("rollback: removed %s (no previous release)", currentLink)
 		return nil
 	}
-	if err := forceSymlink(previousRelease, currentLink); err != nil {
+	if err := d.run.ID.symlink(previousRelease, currentLink); err != nil {
 		log.Printf("rollback: switch %s -> %s failed: %v", currentLink, previousRelease, err)
 		return fmt.Errorf("rollback: switch to previous release: %w", err)
 	}
@@ -498,7 +571,7 @@ func (d *S3MagentoDeployer) rollback(previousRelease, currentLink string) error 
 	defer cancel()
 	var errs []error
 	for _, command := range d.cfg.Deploy.RollbackCommands {
-		if err := runShellCommand(ctx, command, previousRelease); err != nil {
+		if err := d.run.Shell(ctx, command, previousRelease); err != nil {
 			log.Printf("rollback: command failed: %v", err)
 			errs = append(errs, fmt.Errorf("rollback command failed: %w", err))
 		}
@@ -715,16 +788,7 @@ func verifyArtifactDigest(expected, actual string) error {
 func ensureDiskSpace(path string, requiredGB uint64) error {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(path, 0o750); err != nil {
-				return fmt.Errorf("create deploy dir: %w", err)
-			}
-			if err := syscall.Statfs(path, &stat); err != nil {
-				return fmt.Errorf("read filesystem stats: %w", err)
-			}
-		} else {
-			return fmt.Errorf("read filesystem stats: %w", err)
-		}
+		return fmt.Errorf("read filesystem stats: %w", err)
 	}
 	available := uint64(stat.Bavail) * uint64(stat.Bsize)
 	required := requiredGB * 1024 * 1024 * 1024
@@ -734,19 +798,30 @@ func ensureDiskSpace(path string, requiredGB uint64) error {
 	return nil
 }
 
-func forceSymlink(target, linkPath string) error {
-	if err := os.MkdirAll(filepath.Dir(linkPath), 0o750); err != nil {
-		return err
+// makeStagingDir creates <releasesDir>/.<version>.tmp-* owned by id.
+func makeStagingDir(id Identity, releasesDir, version string) (string, error) {
+	if err := id.mkdirAll(releasesDir, 0o750); err != nil {
+		return "", fmt.Errorf("create releases dir: %w", err)
 	}
-	tmp := linkPath + ".next"
-	_ = os.Remove(tmp)
-	if err := os.Symlink(target, tmp); err != nil {
-		return err
+	stagingDir, err := os.MkdirTemp(releasesDir, "."+version+".tmp-")
+	if err != nil {
+		return "", fmt.Errorf("create staging dir: %w", err)
 	}
-	return os.Rename(tmp, linkPath)
+	if err := os.Chmod(stagingDir, 0o750); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", fmt.Errorf("chmod staging dir: %w", err)
+	}
+	if err := id.own(stagingDir); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", err
+	}
+	return stagingDir, nil
 }
 
-func linkSharedPaths(releaseDir string, links []SharedTarget) error {
+// linkSharedPaths replaces each target inside the release with a symlink to its source.
+// Directories on the way are resolved inside the release only: a release symlink that leads elsewhere
+// is refused, so deputy never creates files outside the release.
+func linkSharedPaths(id Identity, releaseDir string, links []SharedTarget) error {
 	for _, shared := range links {
 		if shared.Source == "" || shared.Target == "" {
 			return errors.New("shared link source and target are required")
@@ -755,7 +830,10 @@ func linkSharedPaths(releaseDir string, links []SharedTarget) error {
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
+		if err := requireInside(releaseDir, filepath.Dir(targetPath)); err != nil {
+			return fmt.Errorf("shared link %s: %w", shared.Target, err)
+		}
+		if err := id.mkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
 			return err
 		}
 		if err := os.RemoveAll(targetPath); err != nil {
@@ -764,38 +842,15 @@ func linkSharedPaths(releaseDir string, links []SharedTarget) error {
 		if err := os.Symlink(shared.Source, targetPath); err != nil {
 			return err
 		}
+		if err := id.own(targetPath); err != nil {
+			return err
+		}
 	}
 	return nil
-}
-
-// runShellCommand runs command with /bin/sh. {release_dir} is replaced by the shell-quoted release path,
-// which is also exported as RELEASE_DIR.
-func runShellCommand(ctx context.Context, command, releaseDir string) error {
-	expanded := strings.ReplaceAll(command, "{release_dir}", shellQuote(releaseDir))
-	return runCommandEnv(ctx, []string{"RELEASE_DIR=" + releaseDir}, "/bin/sh", "-c", expanded)
 }
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-func runCommand(ctx context.Context, name string, args ...string) error {
-	return runCommandEnv(ctx, nil, name, args...)
-}
-
-func runCommandEnv(ctx context.Context, env []string, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if len(output) == 0 {
-			return err
-		}
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
 }
 
 func normalizeReleaseVersion(artifactName string) string {
@@ -809,15 +864,39 @@ func normalizeReleaseVersion(artifactName string) string {
 	return name
 }
 
-func extractArtifact(ctx context.Context, src, dst string) error {
-	return runCommand(ctx, "tar", "-xzf", src, "-C", dst)
-}
-
 func exceedsTimestampWindow(now, timestamp, window int64) bool {
 	if now >= timestamp {
 		return now-timestamp > window
 	}
 	return timestamp-now > window
+}
+
+// requireInside fails when dir, with symlinks resolved as far as it exists, is not inside base.
+func requireInside(base, dir string) error {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return err
+	}
+	existing := dir
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			break
+		}
+		existing = parent
+	}
+	real, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(realBase, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("%s resolves outside the release", dir)
+	}
+	return nil
 }
 
 func safeJoin(base, unsafePath string) (string, error) {
@@ -862,5 +941,5 @@ func (c Config) validate() error {
 			return errors.New("deploy.s3_endpoint must be a valid http/https URL")
 		}
 	}
-	return nil
+	return c.Stack.validate()
 }

@@ -72,7 +72,11 @@ func newTestEnv(t *testing.T) *testEnv {
 	cfg.Deploy.MinimumDiskSpaceGB = 0
 	cfg.HealthCheck.RetryIntervalSeconds = 1
 	env := &testEnv{t: t, root: root}
-	env.deployer = &S3MagentoDeployer{cfg: cfg}
+	id, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.deployer = &S3MagentoDeployer{cfg: cfg, run: newRunner(id, nil)}
 	env.deployer.download = func(_ context.Context, _, _, destination string) (string, error) {
 		if err := os.WriteFile(destination, env.archive, 0o640); err != nil {
 			return "", err
@@ -427,7 +431,8 @@ func TestShellQuote(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(t.TempDir(), "m")
-	if err := runShellCommand(context.Background(), "cd {release_dir} && pwd > "+shellQuote(marker), out); err != nil {
+	id, _ := currentIdentity()
+	if err := newRunner(id, nil).Shell(context.Background(), "cd {release_dir} && pwd > "+shellQuote(marker), out); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.TrimSpace(readFile(t, marker)); got != out {
