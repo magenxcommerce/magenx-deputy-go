@@ -1,0 +1,238 @@
+package main
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func writeTarGz(t *testing.T, path string, headers []*tar.Header) {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, h := range headers {
+		if h.Typeflag == 0 {
+			h.Typeflag = tar.TypeReg
+		}
+		if h.Mode == 0 {
+			h.Mode = 0o644
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	writeFile(t, path, buf.String(), 0o644)
+}
+
+func TestCheckArchive(t *testing.T) {
+	tests := []struct {
+		name    string
+		strip   int
+		headers []*tar.Header
+		want    string
+	}{
+		{"plain", 0, []*tar.Header{{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}, {Name: "app/index.php"}, {Name: "vendor/bin/x", Typeflag: tar.TypeSymlink, Linkname: "../pkg/bin/x"}}, ""},
+		{"strip top dir", 1, []*tar.Header{{Name: "repo-sha/", Typeflag: tar.TypeDir, Mode: 0o755}, {Name: "repo-sha/a", Typeflag: tar.TypeLink, Linkname: "repo-sha/b"}}, ""},
+		{"absolute", 0, []*tar.Header{{Name: "/etc/passwd"}}, "absolute path"},
+		{"dot dot", 0, []*tar.Header{{Name: "../x"}}, "leaves the release"},
+		{"setuid", 0, []*tar.Header{{Name: "bin/x", Mode: 0o4755}}, "setuid"},
+		{"absolute symlink", 0, []*tar.Header{{Name: "var", Typeflag: tar.TypeSymlink, Linkname: "/etc"}}, "symlink to absolute path"},
+		{"escaping symlink", 0, []*tar.Header{{Name: "a/var", Typeflag: tar.TypeSymlink, Linkname: "../../etc"}}, "leaves the release"},
+		{"escaping hard link", 0, []*tar.Header{{Name: "x", Typeflag: tar.TypeLink, Linkname: "../etc/shadow"}}, "hard link"},
+		{"device", 0, []*tar.Header{{Name: "dev", Typeflag: tar.TypeChar}}, "unsupported entry type"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.tar.gz")
+			writeTarGz(t, path, tc.headers)
+			err := checkArchive(path, tc.strip)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLinkSharedPathsRefusesSymlinkOutsideRelease(t *testing.T) {
+	release := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(release, "var")); err != nil {
+		t.Fatal(err)
+	}
+	err := linkSharedPaths(Identity{}, release, []SharedTarget{{Source: "/shared/var/export", Target: "var/export"}})
+	if err == nil || !strings.Contains(err.Error(), "outside the release") {
+		t.Fatalf("err=%v", err)
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("wrote outside the release: %v", entries)
+	}
+}
+
+func TestRunnerCleanEnvironment(t *testing.T) {
+	t.Setenv("DEPUTY_TEST_SECRET", "s3cr3t")
+	t.Setenv("DEPUTY_TEST_PASS", "passed")
+	id, _ := currentIdentity()
+	r := newRunner(id, []string{"DEPUTY_TEST_PASS", "FIXED=1"})
+	out, err := r.Output(context.Background(), t.TempDir(), nil, "/bin/sh", "-c", `echo "$DEPUTY_TEST_SECRET|$DEPUTY_TEST_PASS|$FIXED|$PATH"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "|passed|1|"+commandPath {
+		t.Fatalf("env=%q", got)
+	}
+}
+
+func TestResolveIdentity(t *testing.T) {
+	id, err := resolveIdentity("")
+	if err != nil || id.switchUser || id.UID != os.Geteuid() {
+		t.Fatalf("empty run_as: %+v %v", id, err)
+	}
+	self, err := resolveIdentity(strconv.Itoa(os.Geteuid()))
+	if err != nil || self.switchUser {
+		t.Fatalf("own uid: %+v %v", self, err)
+	}
+	if _, err := resolveIdentity("no-such-user-deputy"); err == nil {
+		t.Fatal("unknown user accepted")
+	}
+	other := "nobody"
+	if os.Geteuid() != 0 {
+		if _, err := resolveIdentity(other); err == nil || !strings.Contains(err.Error(), "needs deputy to run as root") {
+			t.Fatalf("non-root switch: err=%v", err)
+		}
+		return
+	}
+	id, err = resolveIdentity(other)
+	if err != nil || !id.switchUser || id.UID == 0 {
+		t.Fatalf("root -> nobody: %+v %v", id, err)
+	}
+	// numeric uid without passwd entry, e.g. the userns-remapped container user
+	id, err = resolveIdentity("165532:165532")
+	if err != nil || id.UID != 165532 || id.GID != 165532 || !id.switchUser {
+		t.Fatalf("numeric: %+v %v", id, err)
+	}
+}
+
+// TestDeployAsOtherUser runs a code deploy as root with run_as nobody: release files, links and commands
+// belong to nobody, the archive owner is not kept.
+func TestDeployAsOtherUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skip("no user nobody")
+	}
+	env := newTestEnv(t)
+	// t.TempDir parents are 0700 root: let nobody through
+	for p := env.root; p != "/" && p != os.TempDir(); p = filepath.Dir(p) {
+		_ = os.Chmod(p, 0o755)
+	}
+	id, err := resolveIdentity("nobody")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.deployer.run = newRunner(id, nil)
+	env.deployer.cfg.SharedLinks = []SharedTarget{{Source: "/shared/media", Target: "pub/media"}}
+	marker := filepath.Join(env.root, "whoami")
+	writeFile(t, marker, "", 0o666)
+	_ = os.Chmod(marker, 0o666)
+	env.deployer.cfg.Deploy.LeaderCommands = []string{"id -u > " + shellQuote(marker)}
+
+	if err := env.deploy("release_v1.tar.gz", map[string]string{"index.php": "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(readFile(t, marker)); got != nobody.Uid {
+		t.Fatalf("command ran as uid %s, want %s", got, nobody.Uid)
+	}
+	release := env.current()
+	for _, p := range []string{env.currentLink(), release, filepath.Join(release, "index.php"), filepath.Join(release, "pub"), filepath.Join(release, "pub", "media"), env.releasesDir()} {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uid := fmt.Sprint(fi.Sys().(*syscall.Stat_t).Uid); uid != nobody.Uid {
+			t.Errorf("%s owned by %s, want %s", p, uid, nobody.Uid)
+		}
+	}
+}
+
+type recordingDeployer struct {
+	calls []DeployPayload
+}
+
+func (r *recordingDeployer) Deploy(_ context.Context, p DeployPayload) error {
+	r.calls = append(r.calls, p)
+	return nil
+}
+
+func TestWebhookRoutesStackKind(t *testing.T) {
+	cfg := Config{
+		WebhookPath:   "/deploy",
+		WebhookSecret: "secret",
+		HMACKey:       "hmac",
+		Deploy:        DeployConfig{DefaultBrand: "demo", DefaultDomain: "shop.example"},
+	}
+	cfg.applyDefaults()
+	send := func(s *Server, body string) *httptest.ResponseRecorder {
+		now := strconv.FormatInt(time.Now().Unix(), 10)
+		req := httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body))
+		req.Header.Set("X-Webhook-Secret", "secret")
+		req.Header.Set("X-Signature", sign("hmac", []byte(body)))
+		req.Header.Set("X-Timestamp", now)
+		res := httptest.NewRecorder()
+		s.ServeHTTP(res, req)
+		return res
+	}
+
+	code, stack := &recordingDeployer{}, &recordingDeployer{}
+	disabled := &Server{cfg: cfg, deployer: code}
+	if res := send(disabled, `{"kind":"stack","tag":"v1.0.0"}`); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "not enabled") {
+		t.Fatalf("stack disabled: %d %s", res.Code, res.Body)
+	}
+
+	enabled := &Server{cfg: cfg, deployer: code, stack: stack}
+	for body, want := range map[string]string{
+		`{"kind":"stack"}`:                                    "tag is required",
+		`{"kind":"stack","tag":"../x"}`:                       "tag is required",
+		`{"kind":"stack","tag":"v1","artifact_name":"a.tgz"}`: "not valid with kind stack",
+		`{"kind":"stack","tag":"v1","confirm":["a b"]}`:       "invalid service name",
+		`{"kind":"other","tag":"v1"}`:                         "unknown kind",
+		`{"artifact_name":"release_1.tar.gz","tag":"v1"}`:     "only valid with kind stack",
+		`{"kind":"code","artifact_name":"release_1.tar.gz"}`:  "artifact_digest is required",
+	} {
+		if res := send(enabled, body); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), want) {
+			t.Errorf("%s: %d %q want %q", body, res.Code, res.Body, want)
+		}
+	}
+	if len(code.calls)+len(stack.calls) != 0 {
+		t.Fatalf("invalid payloads deployed: %v %v", code.calls, stack.calls)
+	}
+
+	if res := send(enabled, `{"kind":"stack","tag":"v1.0.0","confirm":["mariadb"]}`); res.Code != http.StatusOK {
+		t.Fatalf("stack: %d %s", res.Code, res.Body)
+	}
+	if len(stack.calls) != 1 || stack.calls[0].Tag != "v1.0.0" || stack.calls[0].Confirm[0] != "mariadb" || len(code.calls) != 0 {
+		t.Fatalf("stack calls=%v code calls=%v", stack.calls, code.calls)
+	}
+}

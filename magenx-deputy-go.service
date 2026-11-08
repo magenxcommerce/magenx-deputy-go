@@ -9,13 +9,17 @@ ExecStart=/usr/local/sbin/magenx-deputy-go -config /etc/magenx-deputy-go/config.
 Restart=always
 RestartSec=2
 
-# Run as the Magento site owner so extracted releases, symlinks and
-# leader commands (bin/magento) get the right ownership.
-# Adjust to match deploy.default_brand / the brand directory under deploy.root_dir.
-User=mystore
-Group=mystore
+# Runs as root so it can drive docker (stack) and hand releases to the site user.
+# deploy.run_as / stack.run_as in config.yaml pick the user that owns the releases
+# and runs the commands; deputy refuses to run deploy commands as root.
+# Without stack deploys, User=/Group= the site owner and no run_as works as well.
+User=root
+Group=root
+# Only what dropping to run_as and handing files to it needs.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=
 
-# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, ...
+# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, GITHUB_TOKEN, ...
 EnvironmentFile=-/etc/magenx-deputy-go/env
 
 StandardOutput=journal
@@ -39,8 +43,9 @@ SystemCallArchitectures=native
 ProtectSystem=strict
 
 # Allow write only where deputy needs to act.
-# Adjust to <deploy.root_dir>/<brand> in /etc/magenx-deputy-go/config.yaml.
-ReadWritePaths=/home/mystore
+# Adjust to <deploy.root_dir>/<brand> and stack.dir in /etc/magenx-deputy-go/config.yaml.
+# ~/.docker (docker login) and ~/.sigstore (cosign) of the stack.run_as user, "-" = optional.
+ReadWritePaths=/home/mystore -/opt/mystore -/root/.docker -/root/.sigstore
 
 [Install]
 WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 # Magento release deployer (Go)
 
-A small webhook listener + deployer for Magento release archives stored in S3-compatible storage.
+A small webhook listener + deployer for Magento release archives stored in S3-compatible storage,
+and for docker stack releases published on GitHub (see [Docker stack deploys](#docker-stack-deploys)).
 
 ## Build
 
@@ -21,17 +22,44 @@ Installs:
 - `/etc/magenx-deputy-go/config.yaml` (from `config.example.yaml`, only if missing)
 - `/lib/systemd/system/magenx-deputy-go.service`
 
-The service runs as the Magento site owner, not root, so releases and `bin/magento` output get correct ownership.
-Adjust `User=`, `Group=` and `ReadWritePaths=` in the unit (`systemctl edit magenx-deputy-go`) to the brand user and `<root_dir>/<brand>`, then:
+The service runs as root and drops to `deploy.run_as` (the Magento site owner) for everything that touches
+release files: tar, shared links, symlinks and commands. Releases and `bin/magento` output get the site
+owner, and deputy refuses to start when deploy commands would run as root (`deploy.allow_root_commands`).
+Root is needed to drive docker for [stack deploys](#docker-stack-deploys). Without stack deploys you can
+also run it as the site user: `User=`/`Group=` the site owner and no `run_as`.
+
+Set `deploy.run_as` in the config, adjust `ReadWritePaths=` in the unit (`systemctl edit magenx-deputy-go`)
+to `<root_dir>/<brand>` and `stack.dir`, then:
 
 ```bash
-sudo chgrp mystore /etc/magenx-deputy-go/config.yaml   # config is 0640, site user must read it
 sudo systemctl daemon-reload
 sudo systemctl enable --now magenx-deputy-go
 journalctl -u magenx-deputy-go -f
 ```
 
-Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`, e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `IS_LEADER=false` on non-leader nodes.
+Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`, e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`GITHUB_TOKEN`, `IS_LEADER=false` on non-leader nodes. None of it reaches the commands (see `command_env`).
+
+### Users and privileges
+
+| Step | Runs as |
+|---|---|
+| webhook, HMAC, S3 and GitHub downloads, digest and signature checks, symlink switch, prune | deputy (root) |
+| tar extraction, `pre_switch_commands`, `leader_commands`, `rollback_commands` | `deploy.run_as` |
+| `docker`, `cosign`, stack tar extraction and stack commands | `stack.run_as` (empty = deputy) |
+
+- Files and links deputy creates as root are handed to the `run_as` user.
+- Archives are checked before extraction: absolute paths, `..`, symlinks or hard links leaving the release,
+  devices, fifos and setuid/setgid/sticky bits are refused. tar runs with `--no-same-owner --no-same-permissions`.
+- Shared links are only created inside the release: a release symlink that leads elsewhere is refused.
+- Commands start with a clean environment: `HOME`, `USER`, `LOGNAME`, `PATH`, `RELEASE_DIR` and `command_env`.
+  They run in the release dir.
+- The unit limits root to `CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL`, with
+  `ProtectSystem=strict` and `ReadWritePaths=`. Access to the docker socket is still equal to root on the host.
+
+Upgrading from 1.x: commands no longer inherit the deputy environment and run in the release dir; list the
+variables they need in `deploy.command_env`. With the new root unit, set `deploy.run_as` to the user from the
+old `User=`.
 
 ## Run
 
@@ -54,7 +82,7 @@ The service expects:
 - `X-Signature: sha256=<hex-hmac-of-raw-json-body>`
 - `X-Timestamp: <unix-seconds>`
 
-JSON payload:
+JSON payload (code deploy, `"kind": "code"` or no `kind`):
 
 ```json
 {
@@ -86,8 +114,8 @@ It is required unless `allow_missing_artifact_digest: true` is set; a digest tha
 9. runs the health check (`attempts`, `retry_interval_seconds`)
 10. prunes releases beyond `keep_releases` (never the new or previous one) and leftover staging dirs
 
-Commands run with `/bin/sh -c` as the service user; `{release_dir}` is replaced by the shell-quoted
-release path and exported as `RELEASE_DIR`. The deploy runs to completion (or `deployment_timeout_seconds`)
+Commands run with `/bin/sh -c` as `deploy.run_as` in the release dir; `{release_dir}` is replaced by the
+shell-quoted release path and exported as `RELEASE_DIR`. The deploy runs to completion (or `deployment_timeout_seconds`)
 even if the webhook client disconnects. The webhook answers after the deploy finished: `200 ok` or `500`
 with the error.
 
@@ -107,3 +135,54 @@ Each node deploys independently; only the leader runs commands. The health check
 which behind a load balancer may answer from another node.
 
 All steps, failures and rollbacks are logged (`journalctl -u magenx-deputy-go`).
+
+## Docker stack deploys
+
+With `stack.enabled`, deputy also deploys releases of a docker configuration repository such as
+[magenxcommerce-docker](https://github.com/magenxcommerce/magenxcommerce-docker): the repository at the
+release tag plus the `docker-compose.release.yml` release asset that pins every image by digest.
+It replaces the manual `gh release download`, `verify_release.sh`, `pull`, `up -d`.
+
+Trigger it with the same webhook headers and this payload, or with `stack.poll_interval_seconds`:
+
+```json
+{"kind": "stack", "tag": "v1.11.0", "timestamp": 1711111111, "confirm": ["mariadb"]}
+```
+
+Code and stack deploys share one lock: they never run at the same time.
+
+Setup on the server:
+
+1. `GITHUB_TOKEN` in `/etc/magenx-deputy-go/env`: a classic PAT with `read:packages` (ghcr.io pulls), plus
+   `repo` for a private repository. Set `stack.registry_username` to let deputy run `docker login`, or log in
+   once as the `stack.run_as` user.
+2. Copy `cosign/cosign.pub` of the repository to `stack.cosign_public_key`. Deputy never trusts the key in the
+   downloaded release: who can push to the repository could replace it.
+3. Move server-only files (`.env.secrets`, host overrides) to e.g. `/opt/<brand>/shared/` and list them in
+   `stack.shared_links`; `stack.env_files` are passed to compose as `--env-file`.
+4. Add `stack.dir` to `ReadWritePaths=` and enable `stack` in the config.
+
+Deployment behavior:
+
+1. skips when `current` already is the tag (re-sent webhook, poll)
+2. reads the release from the GitHub API: refuses drafts, prereleases (`allow_prerelease`) and, with
+   `require_immutable`, releases that are not immutable
+3. downloads the source tarball and the lock asset into `<dir>/releases/.<tag>.tmp-*`, checks and extracts it
+4. requires every image in the lock pinned by digest and verifies each one with `cosign verify`
+   (`verify-attestation --type spdxjson` with `require_sbom`)
+5. moves it to `<dir>/releases/<tag>`, links `shared_links`, checks `env_files`
+6. refuses image changes of `confirm_services` that the payload does not list in `confirm`
+7. `docker compose config`, picks the services (`services`, or all minus `exclude_services` and minus services
+   of profiles not in `profiles`), `docker login` (optional), `pull`
+8. runs `pre_up_commands` in the new release; `current` still points to the old one
+9. switches `<dir>/current`, runs `up --detach --no-build --wait --wait-timeout <wait_timeout_seconds>`
+10. checks `health_check_url`, runs `post_up_commands`, prunes releases beyond `keep_releases`
+
+Compose runs with `--project-name <project_name> --project-directory <dir>/releases/<tag>`, so unchanged images
+keep their containers and volumes stay. Failure before the switch removes the new release dir and leaves the
+running stack alone. Failure after the switch points `current` back, runs `up` of the previous release and
+`rollback_commands`. The first stack deploy has no previous release: `current` is removed and the containers
+are left as they are.
+
+Rolling back images does not roll back data: a MariaDB or OpenSearch major upgrade rewrites its volume.
+List such services in `confirm_services` and take a backup (e.g. in `pre_up_commands`) before you confirm.
