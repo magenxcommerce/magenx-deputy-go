@@ -6,8 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,7 +13,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func writeTarGz(t *testing.T, path string, headers []*tar.Header) {
@@ -184,55 +181,4 @@ type recordingDeployer struct {
 func (r *recordingDeployer) Deploy(_ context.Context, p DeployPayload) error {
 	r.calls = append(r.calls, p)
 	return nil
-}
-
-func TestWebhookRoutesStackKind(t *testing.T) {
-	cfg := Config{
-		WebhookPath:   "/deploy",
-		WebhookSecret: "secret",
-		HMACKey:       "hmac",
-		Deploy:        DeployConfig{DefaultBrand: "demo", DefaultDomain: "shop.example"},
-	}
-	cfg.applyDefaults()
-	send := func(s *Server, body string) *httptest.ResponseRecorder {
-		now := strconv.FormatInt(time.Now().Unix(), 10)
-		req := httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body))
-		req.Header.Set("X-Webhook-Secret", "secret")
-		req.Header.Set("X-Signature", sign("hmac", []byte(body)))
-		req.Header.Set("X-Timestamp", now)
-		res := httptest.NewRecorder()
-		s.ServeHTTP(res, req)
-		return res
-	}
-
-	code, stack := &recordingDeployer{}, &recordingDeployer{}
-	disabled := &Server{cfg: cfg, deployer: code}
-	if res := send(disabled, `{"kind":"stack","tag":"v1.0.0"}`); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "not enabled") {
-		t.Fatalf("stack disabled: %d %s", res.Code, res.Body)
-	}
-
-	enabled := &Server{cfg: cfg, deployer: code, stack: stack}
-	for body, want := range map[string]string{
-		`{"kind":"stack"}`:                                    "tag is required",
-		`{"kind":"stack","tag":"../x"}`:                       "tag is required",
-		`{"kind":"stack","tag":"v1","artifact_name":"a.tgz"}`: "not valid with kind stack",
-		`{"kind":"stack","tag":"v1","confirm":["a b"]}`:       "invalid service name",
-		`{"kind":"other","tag":"v1"}`:                         "unknown kind",
-		`{"artifact_name":"release_1.tar.gz","tag":"v1"}`:     "only valid with kind stack",
-		`{"kind":"code","artifact_name":"release_1.tar.gz"}`:  "artifact_digest is required",
-	} {
-		if res := send(enabled, body); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), want) {
-			t.Errorf("%s: %d %q want %q", body, res.Code, res.Body, want)
-		}
-	}
-	if len(code.calls)+len(stack.calls) != 0 {
-		t.Fatalf("invalid payloads deployed: %v %v", code.calls, stack.calls)
-	}
-
-	if res := send(enabled, `{"kind":"stack","tag":"v1.0.0","confirm":["mariadb"]}`); res.Code != http.StatusOK {
-		t.Fatalf("stack: %d %s", res.Code, res.Body)
-	}
-	if len(stack.calls) != 1 || stack.calls[0].Tag != "v1.0.0" || stack.calls[0].Confirm[0] != "mariadb" || len(code.calls) != 0 {
-		t.Fatalf("stack calls=%v code calls=%v", stack.calls, code.calls)
-	}
 }

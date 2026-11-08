@@ -182,7 +182,7 @@ func (id Identity) symlink(target, linkPath string) error {
 }
 
 // Runner starts commands as an identity with a clean environment: HOME, USER, LOGNAME, PATH and the
-// configured extra variables. The deputy environment (S3 keys, GitHub token, ...) is not passed on.
+// configured extra variables. The deputy environment (S3 keys, registry password, ...) is not passed on.
 type Runner struct {
 	ID  Identity
 	Env []string

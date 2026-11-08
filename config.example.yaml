@@ -41,7 +41,7 @@ deploy:
   # Docker host with userns-remap: the host uid of the container user, e.g. "165532:165532".
   run_as: mystore
   # Commands get a clean environment (HOME, USER, LOGNAME, PATH) plus these:
-  # KEY=VALUE, or NAME to pass deputy's own value of NAME. S3 keys and the GitHub token are never passed.
+  # KEY=VALUE, or NAME to pass deputy's own value of NAME. S3 keys and the registry password are never passed.
   command_env: []
   # Commands as root (run_as root, or no run_as while deputy runs as root) are refused unless true.
   allow_root_commands: false
@@ -72,42 +72,45 @@ shared_links:
 #  - source: /home/mystore/shared/app/etc/env.php
 #    target: app/etc/env.php
 
-# Docker stack releases from GitHub: the repository at the release tag plus the
-# docker-compose.release.yml asset that pins every image by digest.
-# Webhook payload: {"kind": "stack", "tag": "v1.11.0", "confirm": ["mariadb"]}
+# Docker stack releases from S3: the release workflow uploads stack_<tag>.tar.gz (the repository at the
+# release tag plus docker-compose.release.yml, which pins every image by digest) and its cosign signature
+# stack_<tag>.tar.gz.sig to <bucket>/<s3_prefix>/, then sends the webhook. Bucket, endpoint, region and
+# credentials are the ones of the deploy section.
+# Webhook payload: {"kind": "stack", "tag": "v1.11.0", "artifact_digest": "sha256:...", "confirm": ["mariadb"]}
 stack:
   enabled: false
-  repo: magenxcommerce/magenxcommerce-docker
-  # GitHub token from /etc/magenx-deputy-go/env, never in this file.
-  # Classic PAT: read:packages (ghcr.io pulls), plus repo for a private repository.
-  token_env: GITHUB_TOKEN
-  # Set to run "docker login ghcr.io" with the token before pulling; empty = run_as user is already logged in.
-  registry: ghcr.io
-  registry_username: ""
+  s3_prefix: stack
   # releases/<tag> and the current symlink
   dir: /opt/mystore/stack
   project_name: mystore
   compose_files: [docker-compose.yml]
-  lock_asset: docker-compose.release.yml
+  lock_file: docker-compose.release.yml
   # relative to the release; server-only files come in through shared_links
   env_files: [.env, .env.secrets]
   # .env.secrets stays where docker.sh created it, next to the clone the server scripts run from
   shared_links:
     - source: /opt/mystore/docker/.env.secrets
       target: .env.secrets
-  # Trust anchor, never taken from the downloaded release. Copy cosign/cosign.pub of the repository here.
+  # Trust anchor for the bundle and every image, never taken from the bundle.
+  # Copy cosign/cosign.pub of the docker repository here.
   cosign_public_key: /etc/magenx-deputy-go/cosign.pub
   cosign_args: ["--insecure-ignore-tlog=true"]
+  # true skips the bundle signature (.sig); image signatures are always checked
+  allow_unsigned_bundle: false
   require_sbom: false
-  allow_prerelease: false
-  require_immutable: false
+  # "docker login <registry>" before pulling, password from the environment variable registry_password_env
+  # (/etc/magenx-deputy-go/env, e.g. a classic PAT with read:packages only).
+  # Empty registry_username: the run_as user is already logged in.
+  registry: ghcr.io
+  registry_username: ""
+  registry_password_env: REGISTRY_PASSWORD
   # empty = every service minus exclude_services, services of profiles not listed in profiles are skipped
   services: []
   exclude_services: [magento]
   profiles: []
   remove_orphans: false
   # An image change of these services needs "confirm": ["<service>"] in the webhook: their data
-  # cannot be rolled back by switching images. Polling never confirms.
+  # cannot be rolled back by switching images.
   confirm_services: [mariadb, opensearch]
   # /bin/sh in a release dir, {release_dir} and $RELEASE_DIR as in deploy commands
   pre_up_commands: []
@@ -120,8 +123,6 @@ stack:
   rollback_timeout_seconds: 900
   minimum_disk_space_gb: 5
   keep_releases: 3
-  # > 0: also deploy the latest release (no draft, no prerelease) on this interval
-  poll_interval_seconds: 0
   # Runs docker, cosign, tar and the commands. Needs the docker socket: root or a member of group docker.
   run_as: ""
   command_env: []

@@ -19,7 +19,7 @@ Group=root
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
 AmbientCapabilities=
 
-# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, GITHUB_TOKEN, ...
+# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, REGISTRY_PASSWORD, ...
 EnvironmentFile=-/etc/magenx-deputy-go/env
 
 StandardOutput=journal
