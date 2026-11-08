@@ -104,7 +104,7 @@ type DeployPayload struct {
 	Brand          string `json:"brand" yaml:"brand"`
 	Domain         string `json:"domain" yaml:"domain"`
 	Timestamp      int64  `json:"timestamp" yaml:"timestamp"`
-	// Tag is the GitHub release of the docker stack repository (kind stack).
+	// Tag is the release of the docker stack (kind stack): name of the release dir, bundle stack_<tag>.tar.gz.
 	Tag string `json:"tag" yaml:"tag"`
 	// Confirm lists services listed in stack.confirm_services whose image may change with this release.
 	Confirm []string `json:"confirm" yaml:"confirm"`
@@ -166,10 +166,7 @@ func main() {
 			log.Fatalf("stack: %v", err)
 		}
 		server.stack = stack
-		log.Printf("stack deploys of %s run as %s", cfg.Stack.Repo, stackID)
-		if cfg.Stack.PollIntervalSeconds > 0 {
-			go server.pollStack(context.Background(), stack, time.Duration(cfg.Stack.PollIntervalSeconds)*time.Second)
-		}
+		log.Printf("stack deploys into %s run as %s", cfg.Stack.Dir, stackID)
 	}
 
 	srv := &http.Server{
@@ -331,7 +328,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "stack deploys are not enabled", http.StatusBadRequest)
 			return
 		}
-		if msg := validateStackPayload(payload); msg != "" {
+		if msg := s.validateStackPayload(&payload); msg != "" {
 			http.Error(w, msg, http.StatusBadRequest)
 			return
 		}
@@ -701,15 +698,22 @@ func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, domain, release
 
 // downloadArtifact writes the S3 object to destination and returns its sha256 as "sha256:<hex>".
 func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifact, destination string) (string, error) {
-	bucket := d.cfg.Deploy.S3Bucket
-	if d.cfg.Deploy.S3BucketPerBrand {
+	return downloadS3(ctx, d.cfg.Deploy, brand, d.cfg.Deploy.S3Prefix, artifact, destination)
+}
+
+// downloadS3 writes s3://<bucket>/<prefix>/<artifact> to destination and returns its sha256 as "sha256:<hex>".
+// Bucket, endpoint, region and path style come from the deploy section; the bucket is the brand with
+// s3_bucket_per_brand.
+func downloadS3(ctx context.Context, dc DeployConfig, brand, prefix, artifact, destination string) (string, error) {
+	bucket := dc.S3Bucket
+	if dc.S3BucketPerBrand {
 		bucket = brand
 	}
 	if bucket == "" {
 		return "", errors.New("s3 bucket is not configured")
 	}
 
-	prefix := strings.Trim(d.cfg.Deploy.S3Prefix, "/")
+	prefix = strings.Trim(prefix, "/")
 	artifactPath := artifact
 	if prefix != "" {
 		artifactPath = prefix + "/" + artifact
@@ -717,13 +721,13 @@ func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifac
 	s3URI := fmt.Sprintf("s3://%s/%s", bucket, artifactPath)
 
 	loadOptions := []func(*sdkconfig.LoadOptions) error{
-		sdkconfig.WithRegion(d.cfg.Deploy.S3Region),
+		sdkconfig.WithRegion(dc.S3Region),
 	}
-	if d.cfg.Deploy.S3Endpoint != "" {
+	if dc.S3Endpoint != "" {
 		resolver := awsv2.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (awsv2.Endpoint, error) {
 			if service == s3.ServiceID {
 				return awsv2.Endpoint{
-					URL:               d.cfg.Deploy.S3Endpoint,
+					URL:               dc.S3Endpoint,
 					HostnameImmutable: true,
 				}, nil
 			}
@@ -738,7 +742,7 @@ func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifac
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = d.cfg.Deploy.S3UsePathStyle
+		o.UsePathStyle = dc.S3UsePathStyle
 	})
 
 	obj, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -750,7 +754,7 @@ func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifac
 	}
 	defer obj.Body.Close()
 
-	out, err := os.Create(destination)
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
 	if err != nil {
 		return "", fmt.Errorf("create local artifact file: %w", err)
 	}
@@ -940,6 +944,9 @@ func (c Config) validate() error {
 		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 			return errors.New("deploy.s3_endpoint must be a valid http/https URL")
 		}
+	}
+	if c.Stack.Enabled && !c.Deploy.S3BucketPerBrand && c.Deploy.S3Bucket == "" {
+		return errors.New("stack deploys download from S3: set deploy.s3_bucket or deploy.s3_bucket_per_brand")
 	}
 	return c.Stack.validate()
 }

@@ -39,7 +39,7 @@ func checkArchive(file string, stripComponents int) error {
 			return fmt.Errorf("archive: %w", err)
 		}
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
-			// pax global header, e.g. the commit id in GitHub tarballs
+			// pax global header, e.g. the commit id written by git archive
 			continue
 		}
 		name, ok := stripPath(hdr.Name, stripComponents)

@@ -1,7 +1,7 @@
 # Magento release deployer (Go)
 
 A small webhook listener + deployer for Magento release archives stored in S3-compatible storage,
-and for docker stack releases published on GitHub (see [Docker stack deploys](#docker-stack-deploys)).
+and for docker stack release bundles in the same storage (see [Docker stack deploys](#docker-stack-deploys)).
 
 ## Build
 
@@ -38,13 +38,13 @@ journalctl -u magenx-deputy-go -f
 ```
 
 Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`, e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`GITHUB_TOKEN`, `IS_LEADER=false` on non-leader nodes. None of it reaches the commands (see `command_env`).
+`REGISTRY_PASSWORD`, `IS_LEADER=false` on non-leader nodes. None of it reaches the commands (see `command_env`).
 
 ### Users and privileges
 
 | Step | Runs as |
 |---|---|
-| webhook, HMAC, S3 and GitHub downloads, digest and signature checks, symlink switch, prune | deputy (root) |
+| webhook, HMAC, S3 downloads, digest checks, symlink switch, prune | deputy (root) |
 | tar extraction, `pre_switch_commands`, `leader_commands`, `rollback_commands` | `deploy.run_as` |
 | `docker`, `cosign`, stack tar extraction and stack commands | `stack.run_as` (empty = deputy) |
 
@@ -139,37 +139,43 @@ All steps, failures and rollbacks are logged (`journalctl -u magenx-deputy-go`).
 ## Docker stack deploys
 
 With `stack.enabled`, deputy also deploys releases of a docker configuration repository such as
-[magenxcommerce-docker](https://github.com/magenxcommerce/magenxcommerce-docker): the repository at the
-release tag plus the `docker-compose.release.yml` release asset that pins every image by digest.
-It replaces the manual `gh release download`, `verify_release.sh`, `pull`, `up -d`.
+[magenxcommerce-docker](https://github.com/magenxcommerce/magenxcommerce-docker), the same way as Magento
+releases: the release workflow uploads a bundle to S3 and sends the webhook. It replaces the manual
+`gh release download`, `verify_release.sh`, `pull`, `up -d`.
 
-Trigger it with the same webhook headers and this payload, or with `stack.poll_interval_seconds`:
+The bundle `stack_<tag>.tar.gz` holds the repository at the release tag plus `docker-compose.release.yml`,
+which pins every image by digest. Next to it, `stack_<tag>.tar.gz.sig` is its signature (`cosign sign-blob
+--bundle`). Both are in `<bucket>/<stack.s3_prefix>/`; bucket, endpoint, region and credentials are the ones of
+the `deploy` section.
+
+Payload, with the same webhook headers:
 
 ```json
-{"kind": "stack", "tag": "v1.11.0", "timestamp": 1711111111, "confirm": ["mariadb"]}
+{"kind": "stack", "tag": "v1.11.0", "artifact_digest": "sha256:...", "timestamp": 1711111111, "confirm": ["mariadb"]}
 ```
 
-Code and stack deploys share one lock: they never run at the same time.
+`artifact_name` defaults to `stack_<tag>.tar.gz`. `artifact_digest` is required unless
+`allow_missing_artifact_digest`. Code and stack deploys share one lock: they never run at the same time.
 
 Setup on the server:
 
-1. `GITHUB_TOKEN` in `/etc/magenx-deputy-go/env`: a classic PAT with `read:packages` (ghcr.io pulls), plus
-   `repo` for a private repository. Set `stack.registry_username` to let deputy run `docker login`, or log in
-   once as the `stack.run_as` user.
-2. Copy `cosign/cosign.pub` of the repository to `stack.cosign_public_key`. Deputy never trusts the key in the
-   downloaded release: who can push to the repository could replace it.
+1. Copy `cosign/cosign.pub` of the docker repository to `stack.cosign_public_key`. Deputy never trusts a key
+   from the bundle: who can push to the repository could replace it.
+2. Registry login for the image pulls: log in once as the `stack.run_as` user, or set `stack.registry_username`
+   and put the password in `/etc/magenx-deputy-go/env` (`REGISTRY_PASSWORD`, for ghcr.io a classic PAT with
+   `read:packages` only).
 3. List server-only files in `stack.shared_links`, e.g. `/opt/<brand>/docker/.env.secrets` where `docker.sh`
    created it; each release links to it. `stack.env_files` are passed to compose as `--env-file`.
 4. Add `stack.dir` to `ReadWritePaths=` and enable `stack` in the config.
 
 Deployment behavior:
 
-1. skips when `current` already is the tag (re-sent webhook, poll)
-2. reads the release from the GitHub API: refuses drafts, prereleases (`allow_prerelease`) and, with
-   `require_immutable`, releases that are not immutable
-3. downloads the source tarball and the lock asset into `<dir>/releases/.<tag>.tmp-*`, checks and extracts it
-4. requires every image in the lock pinned by digest and verifies each one with `cosign verify`
-   (`verify-attestation --type spdxjson` with `require_sbom`)
+1. skips when `current` already is the tag (re-sent webhook)
+2. downloads the bundle from S3 next to `<dir>/releases/.<tag>.tmp-*`, verifies its sha256 against
+   `artifact_digest` and its signature with `cosign verify-blob` (skipped with `allow_unsigned_bundle`)
+3. checks and extracts it into the staging dir
+4. requires every image in `docker-compose.release.yml` pinned by digest and verifies each one with
+   `cosign verify` (`verify-attestation --type spdxjson` with `require_sbom`)
 5. moves it to `<dir>/releases/<tag>`, links `shared_links`, checks `env_files`
 6. refuses image changes of `confirm_services` that the payload does not list in `confirm`
 7. `docker compose config`, picks the services (`services`, or all minus `exclude_services` and minus services
