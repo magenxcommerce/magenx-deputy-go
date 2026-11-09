@@ -127,7 +127,22 @@ var (
 	brandPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 	artifactPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+\.(?:tar\.gz|tgz)$`)
 	digestPattern   = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
+	// namePattern is one path element: release versions, stack tags and artifact names. Deployers check
+	// it, plus "no ..", where they build paths, so they are safe without the webhook handler's checks.
+	namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 )
+
+// logSafe removes CR and LF, so a value from the webhook can never start a new log line. Payload values
+// pass through it where a deployer takes them over: they are logged, and errors that contain them are.
+func logSafe(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	return strings.ReplaceAll(s, "\r", "")
+}
+
+// isSafeName reports whether s can be used as one path element: namePattern and no "..".
+func isSafeName(s string) bool {
+	return namePattern.MatchString(s) && !strings.Contains(s, "..")
+}
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
@@ -376,7 +391,7 @@ func (s *Server) validateCodePayload(payload *DeployPayload) string {
 	if s.cfg.HealthCheck.Enabled && payload.Domain == "" {
 		return "domain is required when health_check is enabled"
 	}
-	if !isValidPayloadPathFields(payload.Brand, payload.ArtifactName) {
+	if !isValidPayloadPathFields(payload.Brand, payload.ArtifactName) || !isSafeName(normalizeReleaseVersion(payload.ArtifactName)) {
 		return "invalid brand or artifact_name format"
 	}
 	if payload.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
@@ -413,17 +428,29 @@ type S3MagentoDeployer struct {
 }
 
 func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
-	artifactFile := filepath.Base(payload.ArtifactName)
+	// Paths come from the config and from names checked here; payload fields are not used in paths.
+	brand := d.cfg.Deploy.DefaultBrand
+	if payload.Brand != "" && payload.Brand != brand {
+		return fmt.Errorf("brand %q does not match deploy.default_brand", logSafe(payload.Brand))
+	}
+	artifactFile := logSafe(payload.ArtifactName)
+	artifactDigest := logSafe(payload.ArtifactDigest)
+	if !namePattern.MatchString(artifactFile) || strings.Contains(artifactFile, "..") {
+		return fmt.Errorf("invalid artifact name %q", artifactFile)
+	}
 	releaseVersion := normalizeReleaseVersion(artifactFile)
+	if !namePattern.MatchString(releaseVersion) || strings.Contains(releaseVersion, "..") {
+		return fmt.Errorf("invalid release version %q from artifact %q", releaseVersion, artifactFile)
+	}
 	// absolute: symlink targets must not depend on the service working directory
-	deployDir, err := filepath.Abs(filepath.Join(d.cfg.Deploy.RootDir, payload.Brand))
+	deployDir, err := filepath.Abs(filepath.Join(d.cfg.Deploy.RootDir, brand))
 	if err != nil {
 		return fmt.Errorf("resolve deploy dir: %w", err)
 	}
 	releasesDir := filepath.Join(deployDir, d.cfg.Deploy.ReleasesDirName)
 	currentLink := filepath.Join(deployDir, filepath.FromSlash(d.cfg.Deploy.CurrentLinkSuffix))
 
-	log.Printf("deploy %s: start (brand=%s)", releaseVersion, payload.Brand)
+	log.Printf("deploy %s: start (brand=%s)", releaseVersion, brand)
 	defer func() {
 		if err != nil {
 			log.Printf("deploy %s: failed: %v", releaseVersion, err)
@@ -437,7 +464,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, payload, releasesDir, releaseVersion)
+	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, artifactDigest, releasesDir, releaseVersion)
 	if err != nil {
 		return err
 	}
@@ -479,7 +506,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	}
 
 	if d.cfg.HealthCheck.Enabled {
-		if err := d.healthCheck(ctx, payload.Domain, releaseVersion); err != nil {
+		if err := d.healthCheck(ctx, releaseVersion); err != nil {
 			return err
 		}
 	}
@@ -494,7 +521,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 // prepareRelease downloads, verifies and extracts the artifact into a staging directory, then renames it
 // to a release directory that did not exist before. An existing (possibly live) release is never touched.
 // On error nothing is left behind.
-func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPayload, releasesDir, releaseVersion string) (releaseDir string, err error) {
+func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactFile, artifactDigest, releasesDir, releaseVersion string) (releaseDir string, err error) {
 	stagingDir, err := makeStagingDir(d.run.ID, releasesDir, releaseVersion)
 	if err != nil {
 		return "", err
@@ -509,17 +536,16 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, payload DeployPa
 		}
 	}()
 
-	artifactFile := filepath.Base(payload.ArtifactName)
 	artifactPath := filepath.Join(stagingDir, artifactFile)
 	download := d.download
 	if download == nil {
 		download = d.downloadArtifact
 	}
-	actualDigest, err := download(ctx, payload.Brand, artifactFile, artifactPath)
+	actualDigest, err := download(ctx, brand, artifactFile, artifactPath)
 	if err != nil {
 		return "", err
 	}
-	if err := verifyArtifactDigest(payload.ArtifactDigest, actualDigest); err != nil {
+	if err := verifyArtifactDigest(artifactDigest, actualDigest); err != nil {
 		return "", err
 	}
 	if err := d.run.ID.own(artifactPath); err != nil {
@@ -651,13 +677,13 @@ func (d *S3MagentoDeployer) isLeader() bool {
 }
 
 // healthCheck retries up to HealthCheck.Attempts times, waiting RetryIntervalSeconds between attempts.
-func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVersion string) error {
-	if domain == "" {
-		return errors.New("domain is required for health check")
+func (d *S3MagentoDeployer) healthCheck(ctx context.Context, releaseVersion string) error {
+	if d.cfg.Deploy.DefaultDomain == "" {
+		return errors.New("deploy.default_domain is required for health check")
 	}
 	var err error
 	for attempt := 1; attempt <= d.cfg.HealthCheck.Attempts; attempt++ {
-		if err = d.healthCheckOnce(ctx, domain, releaseVersion); err == nil {
+		if err = d.healthCheckOnce(ctx, releaseVersion); err == nil {
 			return nil
 		}
 		log.Printf("deploy %s: health check attempt %d/%d: %v", releaseVersion, attempt, d.cfg.HealthCheck.Attempts, err)
@@ -673,11 +699,16 @@ func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVers
 	return err
 }
 
-func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, domain, releaseVersion string) error {
+// healthCheckURL is <scheme>://<deploy.default_domain>/<path_template with the escaped release version>.
+// The host comes from the config only, never from the webhook payload: the webhook may only repeat
+// the configured domain, and the release version can only land in the path or query.
+func (d *S3MagentoDeployer) healthCheckURL(releaseVersion string) string {
 	path := fmt.Sprintf(d.cfg.HealthCheck.PathTemplate, url.QueryEscape(releaseVersion))
-	checkURL := fmt.Sprintf("%s://%s%s", d.cfg.HealthCheck.Scheme, domain, path)
+	return fmt.Sprintf("%s://%s/%s", d.cfg.HealthCheck.Scheme, d.cfg.Deploy.DefaultDomain, strings.TrimPrefix(path, "/"))
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
+func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, releaseVersion string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.healthCheckURL(releaseVersion), nil)
 	if err != nil {
 		return err
 	}
