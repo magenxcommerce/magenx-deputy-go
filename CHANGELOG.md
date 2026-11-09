@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.0...v2.0.1-rc) (2026-11-09)
+
+
+### 🐛 Bug Fixes
+
+* Address CodeQL request-forgery, path-injection and log-injection alerts, create tags for draft releases ([#39](https://github.com/magenxcommerce/magenx-deputy-go/issues/39)) ([f3e486c](https://github.com/magenxcommerce/magenx-deputy-go/commit/f3e486cfad17708d9cee35178a779e0128f85ece))
+
 ## [2.0.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v1.0.0...v2.0.0) (2026-11-08)
 
 
