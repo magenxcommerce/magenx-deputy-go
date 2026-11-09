@@ -60,7 +60,7 @@ func resolveIdentity(spec string) (Identity, error) {
 	// supplementary groups, e.g. docker; a numeric uid without passwd entry has none
 	if gids, err := u.GroupIds(); err == nil {
 		for _, g := range gids {
-			if n, err := strconv.ParseUint(g, 10, 32); err == nil && int(n) != id.GID {
+			if n, err := strconv.ParseUint(g, 10, 32); err == nil && uint32(n) != uint32(id.GID) {
 				id.Groups = append(id.Groups, uint32(n))
 			}
 		}
