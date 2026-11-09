@@ -357,13 +357,15 @@ func TestDeployHealthCheckRetriesThenRollsBack(t *testing.T) {
 	u, _ := url.Parse(srv.URL)
 
 	env := newTestEnv(t)
+	env.deployer.cfg.Deploy.DefaultDomain = u.Host
 	env.deployer.cfg.HealthCheck.Enabled = true
 	env.deployer.cfg.HealthCheck.Scheme = "http"
 	env.deployer.cfg.HealthCheck.Attempts = 2
 	deploy := func(artifact string) error {
 		env.archive = makeTarGz(t, map[string]string{"index.php": artifact})
+		// the payload domain is ignored: the health check only goes to deploy.default_domain
 		return env.deployer.Deploy(context.Background(), DeployPayload{
-			ArtifactName: artifact, ArtifactDigest: digestOf(env.archive), Brand: "demo", Domain: u.Host,
+			ArtifactName: artifact, ArtifactDigest: digestOf(env.archive), Brand: "demo", Domain: "other.example",
 		})
 	}
 
@@ -437,5 +439,25 @@ func TestShellQuote(t *testing.T) {
 	}
 	if got := strings.TrimSpace(readFile(t, marker)); got != out {
 		t.Fatalf("pwd=%q want %q", got, out)
+	}
+}
+
+func TestHealthCheckURLHostFromConfig(t *testing.T) {
+	d := &S3MagentoDeployer{cfg: Config{Deploy: DeployConfig{DefaultDomain: "shop.example"}}}
+	d.cfg.applyDefaults()
+	for version, want := range map[string]string{
+		"2.4.7":            "https://shop.example/health_check.php?release=2.4.7",
+		"x@evil.example":   "https://shop.example/health_check.php?release=x%40evil.example",
+		"/../evil.example": "https://shop.example/health_check.php?release=%2F..%2Fevil.example",
+	} {
+		got := d.healthCheckURL(version)
+		u, err := url.Parse(got)
+		if err != nil || got != want || u.Host != "shop.example" {
+			t.Errorf("%q: url=%q host=%q want %q", version, got, u.Host, want)
+		}
+	}
+	d.cfg.HealthCheck.PathTemplate = "health?release=%s"
+	if got := d.healthCheckURL("v1"); got != "https://shop.example/health?release=v1" {
+		t.Errorf("template without leading slash: %q", got)
 	}
 }

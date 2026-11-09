@@ -479,7 +479,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	}
 
 	if d.cfg.HealthCheck.Enabled {
-		if err := d.healthCheck(ctx, payload.Domain, releaseVersion); err != nil {
+		if err := d.healthCheck(ctx, releaseVersion); err != nil {
 			return err
 		}
 	}
@@ -651,13 +651,13 @@ func (d *S3MagentoDeployer) isLeader() bool {
 }
 
 // healthCheck retries up to HealthCheck.Attempts times, waiting RetryIntervalSeconds between attempts.
-func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVersion string) error {
-	if domain == "" {
-		return errors.New("domain is required for health check")
+func (d *S3MagentoDeployer) healthCheck(ctx context.Context, releaseVersion string) error {
+	if d.cfg.Deploy.DefaultDomain == "" {
+		return errors.New("deploy.default_domain is required for health check")
 	}
 	var err error
 	for attempt := 1; attempt <= d.cfg.HealthCheck.Attempts; attempt++ {
-		if err = d.healthCheckOnce(ctx, domain, releaseVersion); err == nil {
+		if err = d.healthCheckOnce(ctx, releaseVersion); err == nil {
 			return nil
 		}
 		log.Printf("deploy %s: health check attempt %d/%d: %v", releaseVersion, attempt, d.cfg.HealthCheck.Attempts, err)
@@ -673,11 +673,16 @@ func (d *S3MagentoDeployer) healthCheck(ctx context.Context, domain, releaseVers
 	return err
 }
 
-func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, domain, releaseVersion string) error {
+// healthCheckURL is <scheme>://<deploy.default_domain>/<path_template with the escaped release version>.
+// The host comes from the config only, never from the webhook payload: the webhook may only repeat
+// the configured domain, and the release version can only land in the path or query.
+func (d *S3MagentoDeployer) healthCheckURL(releaseVersion string) string {
 	path := fmt.Sprintf(d.cfg.HealthCheck.PathTemplate, url.QueryEscape(releaseVersion))
-	checkURL := fmt.Sprintf("%s://%s%s", d.cfg.HealthCheck.Scheme, domain, path)
+	return fmt.Sprintf("%s://%s/%s", d.cfg.HealthCheck.Scheme, d.cfg.Deploy.DefaultDomain, strings.TrimPrefix(path, "/"))
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
+func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, releaseVersion string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.healthCheckURL(releaseVersion), nil)
 	if err != nil {
 		return err
 	}
