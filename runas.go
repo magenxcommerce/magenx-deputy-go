@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/user"
@@ -60,7 +61,7 @@ func resolveIdentity(spec string) (Identity, error) {
 	// supplementary groups, e.g. docker; a numeric uid without passwd entry has none
 	if gids, err := u.GroupIds(); err == nil {
 		for _, g := range gids {
-			if n, err := strconv.ParseUint(g, 10, 32); err == nil && int(n) != id.GID {
+			if n, err := strconv.ParseUint(g, 10, 32); err == nil && uint32(n) != uint32(id.GID) {
 				id.Groups = append(id.Groups, uint32(n))
 			}
 		}
@@ -96,7 +97,7 @@ func lookupUser(name string) (*user.User, error) {
 	if u, err := user.Lookup(name); err == nil {
 		return u, nil
 	}
-	if _, err := strconv.Atoi(name); err != nil {
+	if !isNumericID(name) {
 		return nil, fmt.Errorf("unknown user %q", name)
 	}
 	if u, err := user.LookupId(name); err == nil {
@@ -112,10 +113,17 @@ func lookupGroup(name string) (*user.Group, error) {
 	if g, err := user.LookupGroup(name); err == nil {
 		return g, nil
 	}
-	if _, err := strconv.Atoi(name); err != nil {
+	if !isNumericID(name) {
 		return nil, fmt.Errorf("unknown group %q", name)
 	}
 	return &user.Group{Gid: name, Name: name}, nil
+}
+
+// isNumericID reports whether s is a plain decimal uid or gid: no sign, fits in 32 bits,
+// and is not 4294967295, the (uid_t)-1 that setuid and chown read as "leave unchanged".
+func isNumericID(s string) bool {
+	n, err := strconv.ParseUint(s, 10, 32)
+	return err == nil && n != math.MaxUint32
 }
 
 func (id Identity) isRoot() bool { return id.UID == 0 }

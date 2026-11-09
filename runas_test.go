@@ -112,6 +112,12 @@ func TestResolveIdentity(t *testing.T) {
 	if _, err := resolveIdentity("no-such-user-deputy"); err == nil {
 		t.Fatal("unknown user accepted")
 	}
+	// negative, signed or out-of-range ids would wrap when converted to uint32
+	for _, spec := range []string{"-1", "+0", "4294967295", "4294967296", "0:-1", "0:4294967295"} {
+		if _, err := resolveIdentity(spec); err == nil {
+			t.Errorf("run_as %q accepted", spec)
+		}
+	}
 	other := "nobody"
 	if os.Geteuid() != 0 {
 		if _, err := resolveIdentity(other); err == nil || !strings.Contains(err.Error(), "needs deputy to run as root") {
