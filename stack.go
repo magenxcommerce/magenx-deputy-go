@@ -79,7 +79,6 @@ type StackConfig struct {
 }
 
 var (
-	tagPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 	servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	projectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 	pinnedPattern  = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
@@ -181,8 +180,8 @@ func (c StackConfig) validate() error {
 
 // validateStackPayload fills artifact_name from the tag and returns an error message, or "".
 func (s *Server) validateStackPayload(p *DeployPayload) string {
-	if !tagPattern.MatchString(p.Tag) {
-		return "tag is required with kind stack and must match [A-Za-z0-9][A-Za-z0-9._+-]*"
+	if !isSafeName(p.Tag) {
+		return "tag is required with kind stack and must match [A-Za-z0-9][A-Za-z0-9._+-]* without \"..\""
 	}
 	if p.ArtifactName == "" {
 		p.ArtifactName = stackBundleName(p.Tag)
@@ -258,9 +257,17 @@ func (d *StackDeployer) fetch(ctx context.Context, name, destination string) (st
 }
 
 func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
+	// Paths come from the config and from names checked here; payload fields are not used in paths.
 	tag := payload.Tag
-	if payload.ArtifactName == "" {
-		payload.ArtifactName = stackBundleName(tag)
+	if !namePattern.MatchString(tag) || strings.Contains(tag, "..") {
+		return fmt.Errorf("invalid tag %q", tag)
+	}
+	name := payload.ArtifactName
+	if name == "" {
+		name = stackBundleName(tag)
+	}
+	if !namePattern.MatchString(name) || strings.Contains(name, "..") {
+		return fmt.Errorf("invalid artifact name %q", name)
 	}
 	previous, previousTag := d.currentRelease()
 	if previousTag == tag {
@@ -268,7 +275,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 		return nil
 	}
 
-	log.Printf("stack %s: start (bundle=%s, current=%s)", tag, payload.ArtifactName, previousTag)
+	log.Printf("stack %s: start (bundle=%s, current=%s)", tag, name, previousTag)
 	defer func() {
 		if err != nil {
 			log.Printf("stack %s: failed: %v", tag, err)
@@ -282,7 +289,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, payload)
+	releaseDir, err := d.prepareRelease(ctx, tag, name, payload.ArtifactDigest)
 	if err != nil {
 		return err
 	}
@@ -348,8 +355,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 
 // prepareRelease downloads the bundle, checks its digest and signature, extracts it, verifies every image
 // and moves it to releases/<tag> with the shared files linked. Nothing is left behind on error.
-func (d *StackDeployer) prepareRelease(ctx context.Context, payload DeployPayload) (releaseDir string, err error) {
-	tag := payload.Tag
+func (d *StackDeployer) prepareRelease(ctx context.Context, tag, name, artifactDigest string) (releaseDir string, err error) {
 	stagingDir, err := makeStagingDir(d.run.ID, d.releasesDir(), tag)
 	if err != nil {
 		return "", err
@@ -365,21 +371,21 @@ func (d *StackDeployer) prepareRelease(ctx context.Context, payload DeployPayloa
 	}()
 
 	// download next to the staging dir: the bundle may contain a file with the same name
-	bundle := filepath.Join(stagingDir+".download", payload.ArtifactName)
+	bundle := filepath.Join(stagingDir+".download", name)
 	if err := d.run.ID.mkdirAll(filepath.Dir(bundle), 0o750); err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(filepath.Dir(bundle))
 
-	digest, err := d.fetch(ctx, payload.ArtifactName, bundle)
+	digest, err := d.fetch(ctx, name, bundle)
 	if err != nil {
 		return "", err
 	}
-	if err := verifyArtifactDigest(payload.ArtifactDigest, digest); err != nil {
+	if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
 		return "", err
 	}
 	if !d.cfg.AllowUnsignedBundle {
-		if err := d.verifyBundle(ctx, payload.ArtifactName, bundle); err != nil {
+		if err := d.verifyBundle(ctx, name, bundle); err != nil {
 			return "", err
 		}
 	}

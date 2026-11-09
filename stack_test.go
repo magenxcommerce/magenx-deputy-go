@@ -577,3 +577,22 @@ func TestWebhookStackPayload(t *testing.T) {
 		t.Fatalf("stack calls=%v code calls=%v", stack.calls, code.calls)
 	}
 }
+
+func TestStackDeployRefusesUnsafeNames(t *testing.T) {
+	e := newStackEnv(t)
+	for _, p := range []DeployPayload{
+		{Tag: "../v1"},
+		{Tag: "v1..2"},
+		{Tag: ".hidden"},
+		{Tag: "v1", ArtifactName: "../stack_v1.tar.gz"},
+		{Tag: "v1", ArtifactName: "stack_..tar.gz"},
+	} {
+		p.Kind = "stack"
+		if err := e.deployer.Deploy(context.Background(), p); err == nil || !strings.Contains(err.Error(), "invalid") {
+			t.Errorf("%+v: err=%v", p, err)
+		}
+	}
+	if len(e.downloads) != 0 || e.releaseCount() != 0 {
+		t.Fatalf("refused payloads downloaded %v or left releases", e.downloads)
+	}
+}

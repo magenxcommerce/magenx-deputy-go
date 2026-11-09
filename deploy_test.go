@@ -461,3 +461,24 @@ func TestHealthCheckURLHostFromConfig(t *testing.T) {
 		t.Errorf("template without leading slash: %q", got)
 	}
 }
+
+func TestDeployRefusesUnsafeNames(t *testing.T) {
+	env := newTestEnv(t)
+	for _, tc := range []struct{ brand, artifact, want string }{
+		{"demo", "...tar.gz", "invalid artifact name"},
+		{"demo", "release_-x.tar.gz", "invalid release version"},
+		{"demo", "release_..tar.gz", "invalid artifact name"},
+		{"demo", "../release_1.tar.gz", "invalid artifact name"},
+		{"demo", "a/release_1.tar.gz", "invalid artifact name"},
+		{"other", "release_1.tar.gz", "does not match deploy.default_brand"},
+	} {
+		env.archive = makeTarGz(t, map[string]string{"index.php": "x"})
+		err := env.deployer.Deploy(context.Background(), DeployPayload{ArtifactName: tc.artifact, ArtifactDigest: digestOf(env.archive), Brand: tc.brand})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s/%s: err=%v want %q", tc.brand, tc.artifact, err, tc.want)
+		}
+	}
+	if _, err := os.Stat(env.releasesDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("releases dir created for refused payloads: %v", err)
+	}
+}
