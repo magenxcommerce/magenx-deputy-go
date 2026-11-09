@@ -482,3 +482,9 @@ func TestDeployRefusesUnsafeNames(t *testing.T) {
 		t.Fatalf("releases dir created for refused payloads: %v", err)
 	}
 }
+
+func TestLogSafe(t *testing.T) {
+	if got := logSafe("v1\n2026/11/09 fake: success\r"); got != "v12026/11/09 fake: success" {
+		t.Fatalf("logSafe=%q", got)
+	}
+}

@@ -132,6 +132,13 @@ var (
 	namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 )
 
+// logSafe removes CR and LF, so a value from the webhook can never start a new log line. Payload values
+// pass through it where a deployer takes them over: they are logged, and errors that contain them are.
+func logSafe(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	return strings.ReplaceAll(s, "\r", "")
+}
+
 // isSafeName reports whether s can be used as one path element: namePattern and no "..".
 func isSafeName(s string) bool {
 	return namePattern.MatchString(s) && !strings.Contains(s, "..")
@@ -424,9 +431,10 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	// Paths come from the config and from names checked here; payload fields are not used in paths.
 	brand := d.cfg.Deploy.DefaultBrand
 	if payload.Brand != "" && payload.Brand != brand {
-		return fmt.Errorf("brand %q does not match deploy.default_brand", payload.Brand)
+		return fmt.Errorf("brand %q does not match deploy.default_brand", logSafe(payload.Brand))
 	}
-	artifactFile := payload.ArtifactName
+	artifactFile := logSafe(payload.ArtifactName)
+	artifactDigest := logSafe(payload.ArtifactDigest)
 	if !namePattern.MatchString(artifactFile) || strings.Contains(artifactFile, "..") {
 		return fmt.Errorf("invalid artifact name %q", artifactFile)
 	}
@@ -456,7 +464,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, payload.ArtifactDigest, releasesDir, releaseVersion)
+	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, artifactDigest, releasesDir, releaseVersion)
 	if err != nil {
 		return err
 	}

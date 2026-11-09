@@ -258,11 +258,11 @@ func (d *StackDeployer) fetch(ctx context.Context, name, destination string) (st
 
 func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
 	// Paths come from the config and from names checked here; payload fields are not used in paths.
-	tag := payload.Tag
+	tag := logSafe(payload.Tag)
 	if !namePattern.MatchString(tag) || strings.Contains(tag, "..") {
 		return fmt.Errorf("invalid tag %q", tag)
 	}
-	name := payload.ArtifactName
+	name := logSafe(payload.ArtifactName)
 	if name == "" {
 		name = stackBundleName(tag)
 	}
@@ -289,7 +289,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, tag, name, payload.ArtifactDigest)
+	releaseDir, err := d.prepareRelease(ctx, tag, name, logSafe(payload.ArtifactDigest))
 	if err != nil {
 		return err
 	}
