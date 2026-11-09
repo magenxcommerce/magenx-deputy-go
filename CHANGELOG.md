@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.2](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.1...v2.0.2) (2026-11-09)
+
+
+### 🐛 Bug Fixes
+
+* Integer conversion of uids and gids ([#41](https://github.com/magenxcommerce/magenx-deputy-go/issues/41)) ([bd373f5](https://github.com/magenxcommerce/magenx-deputy-go/commit/bd373f56217107d5ebcf73f1fd5b77f9cc868775))
+
+
+### 🚦 Maintenance
+
+* **main:** magenx-deputy-go 2.0.2-rc ([#42](https://github.com/magenxcommerce/magenx-deputy-go/issues/42)) ([6cfbfe5](https://github.com/magenxcommerce/magenx-deputy-go/commit/6cfbfe5e11f83d15102b62425cfb433e7ea8fd78))
+
 ## [2.0.2-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.1...v2.0.2-rc) (2026-11-09)
 
 
