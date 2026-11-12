@@ -22,8 +22,8 @@ const commandPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 type Identity struct {
 	Name   string
 	Home   string
-	UID    int
-	GID    int
+	UID    uint32
+	GID    uint32
 	Groups []uint32
 	// switchUser is set when deputy runs as root and the identity is another user.
 	switchUser bool
@@ -43,10 +43,10 @@ func resolveIdentity(spec string) (Identity, error) {
 		return Identity{}, fmt.Errorf("run_as %q: %w", spec, err)
 	}
 	id := Identity{Name: u.Username, Home: u.HomeDir}
-	if id.UID, err = strconv.Atoi(u.Uid); err != nil {
+	if id.UID, err = parseID(u.Uid); err != nil {
 		return Identity{}, fmt.Errorf("run_as %q: uid %q: %w", spec, u.Uid, err)
 	}
-	if id.GID, err = strconv.Atoi(u.Gid); err != nil {
+	if id.GID, err = parseID(u.Gid); err != nil {
 		return Identity{}, fmt.Errorf("run_as %q: gid %q: %w", spec, u.Gid, err)
 	}
 	if hasGroup {
@@ -54,19 +54,19 @@ func resolveIdentity(spec string) (Identity, error) {
 		if err != nil {
 			return Identity{}, fmt.Errorf("run_as %q: %w", spec, err)
 		}
-		if id.GID, err = strconv.Atoi(g.Gid); err != nil {
+		if id.GID, err = parseID(g.Gid); err != nil {
 			return Identity{}, fmt.Errorf("run_as %q: gid %q: %w", spec, g.Gid, err)
 		}
 	}
 	// supplementary groups, e.g. docker; a numeric uid without passwd entry has none
 	if gids, err := u.GroupIds(); err == nil {
 		for _, g := range gids {
-			if n, err := strconv.ParseUint(g, 10, 32); err == nil && uint32(n) != uint32(id.GID) {
-				id.Groups = append(id.Groups, uint32(n))
+			if n, err := parseID(g); err == nil && n != id.GID {
+				id.Groups = append(id.Groups, n)
 			}
 		}
 	}
-	if id.UID == euid && (!hasGroup || id.GID == os.Getegid()) {
+	if int64(id.UID) == int64(euid) && (!hasGroup || int64(id.GID) == int64(os.Getegid())) {
 		return id, nil
 	}
 	if euid != 0 {
@@ -77,8 +77,8 @@ func resolveIdentity(spec string) (Identity, error) {
 }
 
 func currentIdentity() (Identity, error) {
-	id := Identity{UID: os.Geteuid(), GID: os.Getegid()}
-	if u, err := user.LookupId(strconv.Itoa(id.UID)); err == nil {
+	id := Identity{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	if u, err := user.LookupId(strconv.FormatUint(uint64(id.UID), 10)); err == nil {
 		id.Name = u.Username
 		id.Home = u.HomeDir
 	}
@@ -122,8 +122,20 @@ func lookupGroup(name string) (*user.Group, error) {
 // isNumericID reports whether s is a plain decimal uid or gid: no sign, fits in 32 bits,
 // and is not 4294967295, the (uid_t)-1 that setuid and chown read as "leave unchanged".
 func isNumericID(s string) bool {
+	_, err := parseID(s)
+	return err == nil
+}
+
+// parseID parses a uid or gid with the same rules as isNumericID, bounded to uint32 (uid_t, gid_t).
+func parseID(s string) (uint32, error) {
 	n, err := strconv.ParseUint(s, 10, 32)
-	return err == nil && n != math.MaxUint32
+	if err != nil {
+		return 0, err
+	}
+	if n == math.MaxUint32 {
+		return 0, errors.New("reserved id 4294967295")
+	}
+	return uint32(n), nil
 }
 
 func (id Identity) isRoot() bool { return id.UID == 0 }
@@ -140,7 +152,7 @@ func (id Identity) own(path string) error {
 	if !id.switchUser {
 		return nil
 	}
-	if err := os.Lchown(path, id.UID, id.GID); err != nil {
+	if err := os.Lchown(path, int(id.UID), int(id.GID)); err != nil {
 		return fmt.Errorf("chown %s: %w", path, err)
 	}
 	return nil
@@ -222,7 +234,7 @@ func (r Runner) command(ctx context.Context, dir string, env []string, name stri
 	cmd.Env = append(append([]string{}, r.Env...), env...)
 	if r.ID.switchUser {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(r.ID.UID), Gid: uint32(r.ID.GID), Groups: r.ID.Groups},
+			Credential: &syscall.Credential{Uid: r.ID.UID, Gid: r.ID.GID, Groups: r.ID.Groups},
 		}
 	}
 	return cmd

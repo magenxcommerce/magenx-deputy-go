@@ -102,7 +102,7 @@ func TestRunnerCleanEnvironment(t *testing.T) {
 
 func TestResolveIdentity(t *testing.T) {
 	id, err := resolveIdentity("")
-	if err != nil || id.switchUser || id.UID != os.Geteuid() {
+	if err != nil || id.switchUser || int64(id.UID) != int64(os.Geteuid()) {
 		t.Fatalf("empty run_as: %+v %v", id, err)
 	}
 	self, err := resolveIdentity(strconv.Itoa(os.Geteuid()))
