@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.3-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.2...v2.0.3-rc) (2026-11-12)
+
+
+### 🐛 Bug Fixes
+
+* Resolve CodeQL integer conversion and clear-text logging alerts ([#44](https://github.com/magenxcommerce/magenx-deputy-go/issues/44)) ([52fa27b](https://github.com/magenxcommerce/magenx-deputy-go/commit/52fa27bfc6a14fe986c487b961640fc3e022172a))
+
 ## [2.0.2](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.1...v2.0.2) (2026-11-09)
 
 
