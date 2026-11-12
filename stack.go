@@ -44,13 +44,14 @@ type StackConfig struct {
 	// AllowUnsignedBundle skips the bundle signature (<bundle>.sig in S3); images are always verified.
 	AllowUnsignedBundle bool `json:"allow_unsigned_bundle" yaml:"allow_unsigned_bundle"`
 	RequireSBOM         bool `json:"require_sbom" yaml:"require_sbom"`
-	// Registry login before pulling: password from the environment variable RegistryPasswordEnv
+	// Registry login before pulling: password from the environment variable named by RegistryLoginEnv
 	// (e.g. a PAT with read:packages for ghcr.io). Empty RegistryUsername: the run_as user is logged in.
-	Registry            string `json:"registry" yaml:"registry"`
-	RegistryUsername    string `json:"registry_username" yaml:"registry_username"`
-	RegistryPasswordEnv string `json:"registry_password_env" yaml:"registry_password_env"`
-	DockerBinary        string `json:"docker_binary" yaml:"docker_binary"`
-	CosignBinary        string `json:"cosign_binary" yaml:"cosign_binary"`
+	// RegistryLoginEnv holds only the variable name, so it may appear in errors and logs.
+	Registry         string `json:"registry" yaml:"registry"`
+	RegistryUsername string `json:"registry_username" yaml:"registry_username"`
+	RegistryLoginEnv string `json:"registry_password_env" yaml:"registry_password_env"`
+	DockerBinary     string `json:"docker_binary" yaml:"docker_binary"`
+	CosignBinary     string `json:"cosign_binary" yaml:"cosign_binary"`
 	// Services to pull and start; empty is every service minus ExcludeServices and minus services of
 	// profiles that are not in Profiles.
 	Services        []string `json:"services" yaml:"services"`
@@ -116,8 +117,8 @@ func (c *StackConfig) applyDefaults(brand string) {
 	if c.Registry == "" {
 		c.Registry = "ghcr.io"
 	}
-	if c.RegistryPasswordEnv == "" {
-		c.RegistryPasswordEnv = "REGISTRY_PASSWORD"
+	if c.RegistryLoginEnv == "" {
+		c.RegistryLoginEnv = "REGISTRY_PASSWORD"
 	}
 	if c.DockerBinary == "" {
 		c.DockerBinary = "docker"
@@ -615,9 +616,9 @@ func (d *StackDeployer) login(ctx context.Context) error {
 	if d.cfg.RegistryUsername == "" {
 		return nil
 	}
-	password := os.Getenv(d.cfg.RegistryPasswordEnv)
+	password := os.Getenv(d.cfg.RegistryLoginEnv)
 	if password == "" {
-		return fmt.Errorf("stack.registry_username is set but %s is empty", d.cfg.RegistryPasswordEnv)
+		return fmt.Errorf("stack.registry_username is set but %s is empty", d.cfg.RegistryLoginEnv)
 	}
 	cmd := d.run.command(ctx, "", nil, d.cfg.DockerBinary, "login", d.cfg.Registry, "--username", d.cfg.RegistryUsername, "--password-stdin")
 	cmd.Stdin = strings.NewReader(password)
