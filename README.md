@@ -199,10 +199,11 @@ decrypted to tmpfs, where `.env.secrets` of every release leads:
 stack:
   pre_up_commands: ["bash scripts/secrets.sh decrypt"]   # new release's .env.secrets.enc to tmpfs before up
   restore_commands: ["bash scripts/secrets.sh decrypt"]  # previous release's back on failure
-  command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt", "SECRETS_ENV=production"]
+  command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt", "STACK_ENV=production"]
 ```
 
-`SECRETS_ENV` is the server's environment (`staging` on staging servers): it picks `.env.secrets.<env>.enc`.
+`STACK_ENV` is the server's environment (`staging` on staging servers): it picks `.env.secrets.<env>.enc`.
+Staging servers also load the committed staging override: `env_files: [.env, .env.staging, .env.secrets]`.
 
 Add the tmpfs folder (`/run/<brand>-secrets`) to `ReadWritePaths=`: `ProtectSystem=strict` makes `/run`
 read-only for deputy.
