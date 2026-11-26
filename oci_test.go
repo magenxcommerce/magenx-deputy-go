@@ -241,7 +241,7 @@ cat "$DOCKER_CONFIG/config.json" > "$FAKE_DIR/config.json"
 `
 	writeFile(t, filepath.Join(fake, "cosign"), script, 0o755)
 	t.Setenv("DEPUTY_TEST_REGISTRY_PASSWORD", "s3cret-token")
-	c := ociClient{cfg: OCIConfig{Username: "deploy", PasswordEnv: "DEPUTY_TEST_REGISTRY_PASSWORD"}}
+	c := ociClient{cfg: OCIConfig{Username: "deploy", LoginEnv: "DEPUTY_TEST_REGISTRY_PASSWORD"}}
 	id, err := currentIdentity()
 	if err != nil {
 		t.Fatal(err)
