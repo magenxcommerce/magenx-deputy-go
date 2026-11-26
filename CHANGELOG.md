@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.1.0...v2.2.0-rc) (2026-11-26)
+
+
+### 🚀 Features
+
+* Commands as another user than the release owner ([#58](https://github.com/magenxcommerce/magenx-deputy-go/issues/58)) ([9b29d6e](https://github.com/magenxcommerce/magenx-deputy-go/commit/9b29d6e34a571295a9ff79cbdb65a664dfbf6a6e))
+
 ## [2.1.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.3...v2.1.0) (2026-11-26)
 
 
