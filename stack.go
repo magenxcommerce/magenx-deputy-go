@@ -63,9 +63,13 @@ type StackConfig struct {
 	ConfirmServices []string `json:"confirm_services" yaml:"confirm_services"`
 	// Commands run with /bin/sh in a release dir: pre_up in the new release before the switch,
 	// post_up in the new release after "up", rollback in the previous release after switching back.
+	// restore runs in the previous release when a deploy fails after pre_up started: on a rollback before
+	// its "up", and after a failure before the switch. It undoes what pre_up changed outside the release,
+	// e.g. secrets decrypted to tmpfs (bash scripts/secrets.sh decrypt in both lists).
 	PreUpCommands    []string `json:"pre_up_commands" yaml:"pre_up_commands"`
 	PostUpCommands   []string `json:"post_up_commands" yaml:"post_up_commands"`
 	RollbackCommands []string `json:"rollback_commands" yaml:"rollback_commands"`
+	RestoreCommands  []string `json:"restore_commands" yaml:"restore_commands"`
 	// HealthCheckURL is checked after "up" with the attempts, timeout and status of health_check.
 	HealthCheckURL           string `json:"health_check_url" yaml:"health_check_url"`
 	WaitTimeoutSeconds       int64  `json:"wait_timeout_seconds" yaml:"wait_timeout_seconds"`
@@ -294,13 +298,16 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 	if err != nil {
 		return err
 	}
-	switched := false
+	switched, preUpStarted := false, false
 	defer func() {
 		if err == nil {
 			return
 		}
 		if !switched {
 			_ = os.RemoveAll(releaseDir)
+			if preUpStarted {
+				err = errors.Join(err, d.restoreAfterFailure(previous, tag))
+			}
 			return
 		}
 		err = errors.Join(err, d.rollback(previous, tag))
@@ -321,6 +328,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 	}
 	log.Printf("stack %s: pulled %s", tag, strings.Join(services, " "))
 
+	preUpStarted = true
 	for _, command := range d.cfg.PreUpCommands {
 		if err := d.run.Shell(ctx, command, releaseDir); err != nil {
 			return fmt.Errorf("pre-up command failed: %w", err)
@@ -647,6 +655,10 @@ func (d *StackDeployer) rollback(previous, tag string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(d.cfg.RollbackTimeoutSeconds)*time.Second)
 	defer cancel()
 	var errs []error
+	// restore first: "up" of the previous release must read its own files, not what pre_up left
+	if err := d.restore(ctx, previous, tag); err != nil {
+		errs = append(errs, err)
+	}
 	if services, err := d.services(ctx, previous); err != nil {
 		errs = append(errs, fmt.Errorf("rollback: %w", err))
 	} else if err := d.up(ctx, previous, services); err != nil {
@@ -663,6 +675,35 @@ func (d *StackDeployer) rollback(previous, tag string) error {
 		log.Printf("stack %s: %v", tag, e)
 	}
 	return errors.Join(errs...)
+}
+
+// restore runs restore_commands in the previous release. Without a previous release there is nothing to restore.
+func (d *StackDeployer) restore(ctx context.Context, previous, tag string) error {
+	if previous == "" || len(d.cfg.RestoreCommands) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, command := range d.cfg.RestoreCommands {
+		if err := d.run.Shell(ctx, command, previous); err != nil {
+			errs = append(errs, fmt.Errorf("restore command failed: %w", err))
+		}
+	}
+	if len(errs) == 0 {
+		log.Printf("stack %s: restored %s", tag, previous)
+	}
+	return errors.Join(errs...)
+}
+
+// restoreAfterFailure runs restore_commands after a failure before the switch, with a fresh context:
+// the deploy context may already be expired.
+func (d *StackDeployer) restoreAfterFailure(previous, tag string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(d.cfg.RollbackTimeoutSeconds)*time.Second)
+	defer cancel()
+	err := d.restore(ctx, previous, tag)
+	if err != nil {
+		log.Printf("stack %s: %v", tag, err)
+	}
+	return err
 }
 
 func (d *StackDeployer) healthCheck(ctx context.Context, tag string) error {

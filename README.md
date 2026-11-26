@@ -186,9 +186,26 @@ Deployment behavior:
 
 Compose runs with `--project-name <project_name> --project-directory <dir>/releases/<tag>`, so unchanged images
 keep their containers and volumes stay. Failure before the switch removes the new release dir and leaves the
-running stack alone. Failure after the switch points `current` back, runs `up` of the previous release and
-`rollback_commands`. The first stack deploy has no previous release: `current` is removed and the containers
-are left as they are.
+running stack alone. Failure after the switch points `current` back, runs `restore_commands`, `up` of the
+previous release and `rollback_commands`. The first stack deploy has no previous release: `current` is removed
+and the containers are left as they are.
+
+`restore_commands` run in the previous release whenever a deploy fails after `pre_up_commands` started: on a
+rollback before its `up`, and after a failure before the switch. They undo what `pre_up_commands` changed
+outside the release. Example: secrets encrypted with SOPS in the docker repository (`scripts/secrets.sh`),
+decrypted to tmpfs, where `.env.secrets` of every release leads:
+
+```yaml
+stack:
+  pre_up_commands: ["bash scripts/secrets.sh decrypt"]   # new release's .env.secrets.enc to tmpfs before up
+  restore_commands: ["bash scripts/secrets.sh decrypt"]  # previous release's back on failure
+  command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt", "SECRETS_ENV=production"]
+```
+
+`SECRETS_ENV` is the server's environment (`staging` on staging servers): it picks `.env.secrets.<env>.enc`.
+
+Add the tmpfs folder (`/run/<brand>-secrets`) to `ReadWritePaths=`: `ProtectSystem=strict` makes `/run`
+read-only for deputy.
 
 Rolling back images does not roll back data: a MariaDB or OpenSearch major upgrade rewrites its volume.
 List such services in `confirm_services` and take a backup (e.g. in `pre_up_commands`) before you confirm.

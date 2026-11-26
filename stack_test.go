@@ -400,6 +400,75 @@ func TestStackDeployPreUpFailureDoesNotSwitch(t *testing.T) {
 	}
 }
 
+func TestStackDeployRollbackRestoresBeforeUp(t *testing.T) {
+	e := newStackEnv(t)
+	d1 := e.addRelease("v1.0.0", nil, nil)
+	d2 := e.addRelease("v2.0.0", nil, nil)
+	if err := e.deploy("v1.0.0", d1); err != nil {
+		t.Fatal(err)
+	}
+	logFile := shellQuote(filepath.Join(e.fake, "log"))
+	e.deployer.cfg.RestoreCommands = []string{"echo restore {release_dir} >> " + logFile}
+	e.deployer.cfg.RollbackCommands = []string{"echo rollback {release_dir} >> " + logFile}
+	e.resetLog()
+	e.fail("docker", "releases/v2.0.0 .* up ")
+
+	if err := e.deploy("v2.0.0", d2); err == nil {
+		t.Fatal("deploy succeeded although up failed")
+	}
+	v1 := filepath.Join(e.dir, "releases", "v1.0.0")
+	log := e.log()
+	restore := strings.Index(log, "restore "+v1+"\n")
+	up := strings.LastIndex(log, "--project-directory "+v1+" ")
+	rollback := strings.Index(log, "rollback "+v1+"\n")
+	if restore < 0 || up < 0 || rollback < 0 || !(restore < up && up < rollback) {
+		t.Fatalf("want restore, up of v1, rollback in that order\n%s", log)
+	}
+}
+
+func TestStackDeployPreUpFailureRestoresPrevious(t *testing.T) {
+	e := newStackEnv(t)
+	d1 := e.addRelease("v1.0.0", nil, nil)
+	d2 := e.addRelease("v2.0.0", nil, nil)
+	if err := e.deploy("v1.0.0", d1); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(e.fake, "restore")
+	e.deployer.cfg.PreUpCommands = []string{"false"}
+	e.deployer.cfg.RestoreCommands = []string{"echo {release_dir} > " + shellQuote(marker)}
+	e.resetLog()
+
+	err := e.deploy("v2.0.0", d2)
+	if err == nil || !strings.Contains(err.Error(), "pre-up command failed") {
+		t.Fatalf("err=%v", err)
+	}
+	if e.current() != "v1.0.0" || strings.Contains(e.log(), " up ") {
+		t.Fatalf("switched or started after pre-up failure: current=%q\n%s", e.current(), e.log())
+	}
+	if got := strings.TrimSpace(readFile(t, marker)); got != filepath.Join(e.dir, "releases", "v1.0.0") {
+		t.Fatalf("restore command release_dir=%q", got)
+	}
+}
+
+func TestStackDeployPullFailureSkipsRestore(t *testing.T) {
+	e := newStackEnv(t)
+	d1 := e.addRelease("v1.0.0", nil, nil)
+	d2 := e.addRelease("v2.0.0", nil, nil)
+	if err := e.deploy("v1.0.0", d1); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(e.fake, "restore")
+	e.deployer.cfg.RestoreCommands = []string{"touch " + shellQuote(marker)}
+	e.fail("docker", "releases/v2.0.0 .* pull ")
+
+	if err := e.deploy("v2.0.0", d2); err == nil {
+		t.Fatal("deploy succeeded although pull failed")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("restore ran although pre_up_commands never started")
+	}
+}
+
 func TestStackDeployMissingEnvFile(t *testing.T) {
 	e := newStackEnv(t)
 	e.deployer.cfg.EnvFiles = []string{".env", ".env.local"}
