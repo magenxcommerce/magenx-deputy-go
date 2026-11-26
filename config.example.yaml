@@ -121,7 +121,7 @@ stack:
   # release, e.g. SOPS secrets of the docker repository decrypted to tmpfs:
   #   pre_up_commands: ["bash scripts/secrets.sh decrypt"]
   #   restore_commands: ["bash scripts/secrets.sh decrypt"]
-  #   command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt"]
+  #   command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt", "SECRETS_ENV=production"]
   restore_commands: []
   # checked after "up" with health_check attempts, timeout and expected_status
   health_check_url: ""
