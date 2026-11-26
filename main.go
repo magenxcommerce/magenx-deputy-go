@@ -302,8 +302,8 @@ func (c *Config) applyDefaults() {
 		// the release workflows sign without transparency log entry
 		c.Deploy.CosignArgs = []string{"--insecure-ignore-tlog=true"}
 	}
-	if c.OCI.PasswordEnv == "" {
-		c.OCI.PasswordEnv = "REGISTRY_PASSWORD"
+	if c.OCI.LoginEnv == "" {
+		c.OCI.LoginEnv = "REGISTRY_PASSWORD"
 	}
 	if c.Deploy.S3Region == "" {
 		c.Deploy.S3Region = "us-east-1"

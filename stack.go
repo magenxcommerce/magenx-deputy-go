@@ -659,12 +659,12 @@ func (d *StackDeployer) login(ctx context.Context) error {
 	if d.cfg.RegistryUsername == "" {
 		return nil
 	}
-	password := os.Getenv(d.cfg.RegistryLoginEnv)
-	if password == "" {
+	login := os.Getenv(d.cfg.RegistryLoginEnv)
+	if login == "" {
 		return fmt.Errorf("stack.registry_username is set but %s is empty", d.cfg.RegistryLoginEnv)
 	}
 	cmd := d.run.command(ctx, "", nil, d.cfg.DockerBinary, "login", d.cfg.Registry, "--username", d.cfg.RegistryUsername, "--password-stdin")
-	cmd.Stdin = strings.NewReader(password)
+	cmd.Stdin = strings.NewReader(login)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker login %s: %w: %s", d.cfg.Registry, err, strings.TrimSpace(string(out)))
 	}

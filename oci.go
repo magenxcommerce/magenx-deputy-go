@@ -38,9 +38,9 @@ const (
 type OCIConfig struct {
 	// Username empty: anonymous pulls (public packages).
 	Username string `json:"username" yaml:"username"`
-	// PasswordEnv names the environment variable with the password or token (ghcr.io: a classic PAT with
-	// read:packages). Only the name is in the config, so it may appear in errors and logs.
-	PasswordEnv string `json:"password_env" yaml:"password_env"`
+	// LoginEnv names the environment variable with the password or token (ghcr.io: a classic PAT with
+	// read:packages). Only the name is in the config, so it may appear in errors and logs; the value never does.
+	LoginEnv string `json:"password_env" yaml:"password_env"`
 }
 
 // ociArtifact is a release archive resolved from repository:tag.
@@ -62,11 +62,12 @@ type ociClient struct {
 	transport http.RoundTripper
 }
 
-func (c ociClient) password() string {
-	if c.cfg.PasswordEnv == "" {
+// login is the value of oci.password_env: it only goes into the registry auth, never into errors or logs.
+func (c ociClient) login() string {
+	if c.cfg.LoginEnv == "" {
 		return ""
 	}
-	return os.Getenv(c.cfg.PasswordEnv)
+	return os.Getenv(c.cfg.LoginEnv)
 }
 
 func (c ociClient) options(ctx context.Context) ([]remote.Option, error) {
@@ -75,11 +76,11 @@ func (c ociClient) options(ctx context.Context) ([]remote.Option, error) {
 		opts = append(opts, remote.WithTransport(c.transport))
 	}
 	if c.cfg.Username != "" {
-		password := c.password()
-		if password == "" {
-			return nil, fmt.Errorf("oci.username is set but %s is empty", c.cfg.PasswordEnv)
+		login := c.login()
+		if login == "" {
+			return nil, fmt.Errorf("oci.username is set but %s is empty", c.cfg.LoginEnv)
 		}
-		opts = append(opts, remote.WithAuth(&authn.Basic{Username: c.cfg.Username, Password: password}))
+		opts = append(opts, remote.WithAuth(&authn.Basic{Username: c.cfg.Username, Password: login}))
 	}
 	return opts, nil
 }
@@ -201,15 +202,15 @@ func (c ociClient) dockerConfig(repository string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	password := c.password()
-	if password == "" {
-		return "", fmt.Errorf("oci.username is set but %s is empty", c.cfg.PasswordEnv)
+	login := c.login()
+	if login == "" {
+		return "", fmt.Errorf("oci.username is set but %s is empty", c.cfg.LoginEnv)
 	}
 	dir, err := os.MkdirTemp("", "deputy-docker-config-")
 	if err != nil {
 		return "", err
 	}
-	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.Username + ":" + password))
+	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.Username + ":" + login))
 	b, err := json.Marshal(map[string]any{"auths": map[string]any{repo.RegistryStr(): map[string]string{"auth": auth}}})
 	if err == nil {
 		err = os.WriteFile(filepath.Join(dir, "config.json"), b, 0o600)
