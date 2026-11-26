@@ -1,7 +1,9 @@
 # Magento release deployer (Go)
 
-A small webhook listener + deployer for Magento release archives stored in S3-compatible storage,
-and for docker stack release bundles in the same storage (see [Docker stack deploys](#docker-stack-deploys)).
+A small webhook listener + deployer for Magento release archives stored in S3-compatible storage or an OCI
+registry such as ghcr.io, and for docker stack release bundles in the same storage (see
+[Docker stack deploys](#docker-stack-deploys) and [OCI registry source](#oci-registry-source)).
+`magenx-deputy-go bootstrap` deploys both on a new server without a webhook ([Bootstrap](#bootstrap)).
 
 ## Build
 
@@ -44,7 +46,7 @@ Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`,
 
 | Step | Runs as |
 |---|---|
-| webhook, HMAC, S3 downloads, digest checks, symlink switch, prune | deputy (root) |
+| webhook, HMAC, S3 and registry downloads, digest checks, `cosign` on code and OCI bundle manifests, symlink switch, prune | deputy (root) |
 | tar extraction, `pre_switch_commands`, `leader_commands`, `rollback_commands` | `deploy.run_as` |
 | `docker`, `cosign`, stack tar extraction and stack commands | `stack.run_as` (empty = deputy) |
 
@@ -210,3 +212,54 @@ read-only for deputy.
 
 Rolling back images does not roll back data: a MariaDB or OpenSearch major upgrade rewrites its volume.
 List such services in `confirm_services` and take a backup (e.g. in `pre_up_commands`) before you confirm.
+
+## OCI registry source
+
+With `source: oci` (`deploy.source`, `stack.source`) a release is an image in a registry: one manifest whose
+only layer is the archive itself, as `crane append` pushes it, so the layer digest is the sha256 of the archive.
+
+```bash
+crane append -f release_v1.4.0.tar.gz -t ghcr.io/acme/magento-release:v1.4.0
+crane mutate --annotation org.opencontainers.image.version=v1.4.0 ghcr.io/acme/magento-release:v1.4.0
+cosign sign --key cosign.key ghcr.io/acme/magento-release@<manifest digest>
+crane tag ghcr.io/acme/magento-release@<manifest digest> production   # promotion: a tag, no copy
+```
+
+The webhook sends the tag and the layer digest: `{"tag": "v1.4.0", "artifact_digest": "sha256:..."}` for code
+(the release dir is the tag), the same with `"kind": "stack"` for the stack. Deputy resolves `<repository>:<tag>`,
+requires exactly one layer whose digest is `artifact_digest`, checks the manifest signature, then downloads the
+layer and checks its sha256 again before extraction:
+
+- code: the signature is checked when `deploy.cosign_public_key` is set (required by bootstrap).
+- stack: always, with `stack.cosign_public_key`, unless `allow_unsigned_bundle`. It replaces the `.sig` file of S3.
+
+`cosign` runs as deputy itself with `deploy.cosign_binary` / `stack.cosign_binary` and their `cosign_args`. With
+`oci.username` set it gets the registry login through a temporary `DOCKER_CONFIG` (mode 0700, removed after the
+check), never on its command line. Registry login of deputy's own pulls is `oci` in the config, the password
+in the environment variable `oci.password_env` (default `REGISTRY_PASSWORD`, so one read-only PAT serves
+deputy and `stack.registry_username`). A registry on a loopback or private address is reached over http.
+
+## Bootstrap
+
+`magenx-deputy-go bootstrap` deploys the release a moving tag points to, without a webhook: on a new server
+from cloud-init, before the service starts.
+
+```bash
+# the variables of the service's EnvironmentFile: REGISTRY_PASSWORD, IS_LEADER, ...
+set -a; . /etc/magenx-deputy-go/env; set +a
+magenx-deputy-go bootstrap -config /etc/magenx-deputy-go/config.yaml -tag production
+systemctl enable --now magenx-deputy-go
+```
+
+1. refuses to run while `listen_addr` is in use (the service would deploy into the same dirs)
+2. stack (`stack.enabled`): resolves `<stack.oci_repository>:<tag>`, reads the release version from the manifest
+   annotation `org.opencontainers.image.version`, then deploys it like a webhook with that version and the
+   layer digest: `<repository>:<version>` must hold the same archive, the signature must verify
+3. code: the same with `deploy.oci_repository`; skipped when `current` already is that version. Code runs
+   after the stack, so `pre_switch_commands` (setup:upgrade) find the database running
+
+Nothing in bootstrap is covered by the webhook HMAC, so the signatures are the trust anchor: it needs source
+`oci` for both, `stack.allow_unsigned_bundle: false` and `deploy.cosign_public_key`.
+
+Flags: `-tag` (default `production`), `-stack-tag`, `-code-tag`, `-skip-stack`, `-skip-code`, and `-confirm mariadb,...`
+for image changes of `confirm_services` on a server that already runs a stack. Exit status 0 on success.

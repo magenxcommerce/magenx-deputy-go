@@ -7,6 +7,13 @@ deployment_timeout_seconds: 900
 # artifact_digest (sha256:<hex>) is required in the payload; set true only for senders that cannot provide it
 allow_missing_artifact_digest: false
 
+# Registry login for archives deployed with source oci (code and stack), e.g. ghcr.io.
+# Empty username: anonymous pulls (public packages). The password comes from the environment variable
+# password_env (/etc/magenx-deputy-go/env), for ghcr.io a classic PAT with read:packages only.
+oci:
+  username: ""
+  password_env: REGISTRY_PASSWORD
+
 deploy:
   root_dir: /home
   releases_dir_name: releases
@@ -20,6 +27,14 @@ deploy:
   s3_endpoint: https://s3.example.com
   s3_region: us-east-1
   s3_use_path_style: true
+  # s3 (default): release_<version>.tar.gz from the bucket above.
+  # oci: <oci_repository>:<tag>, an image whose only layer is the release archive (crane append), signed with
+  # cosign. Webhook payload: {"tag": "v1.4.0", "artifact_digest": "sha256:<layer digest>"}, the release dir
+  # is the tag. "magenx-deputy-go bootstrap" needs oci.
+  source: s3
+  oci_repository: ""
+  # oci: verify the release manifest signature before the download. Required by bootstrap.
+  cosign_public_key: ""
   leader_env_var: IS_LEADER
   leader_default: true
   # Leader only. {release_dir} = shell-quoted path of the release the command runs for (also $RELEASE_DIR).
@@ -72,13 +87,17 @@ shared_links:
 #  - source: /home/mystore/shared/app/etc/env.php
 #    target: app/etc/env.php
 
-# Docker stack releases from S3: the release workflow uploads stack_<tag>.tar.gz (the repository at the
-# release tag plus docker-compose.release.yml, which pins every image by digest) and its cosign signature
-# stack_<tag>.tar.gz.sig to <bucket>/<s3_prefix>/, then sends the webhook. Bucket, endpoint, region and
-# credentials are the ones of the deploy section.
+# Docker stack releases: stack_<tag>.tar.gz is the repository at the release tag plus
+# docker-compose.release.yml, which pins every image by digest.
+# source s3: the release workflow uploads it and its cosign signature stack_<tag>.tar.gz.sig to
+# <bucket>/<s3_prefix>/; bucket, endpoint, region and credentials are the ones of the deploy section.
+# source oci: the release workflow pushes it as the only layer of <oci_repository>:<tag> and signs that
+# manifest with the key below.
 # Webhook payload: {"kind": "stack", "tag": "v1.11.0", "artifact_digest": "sha256:...", "confirm": ["mariadb"]}
 stack:
   enabled: false
+  source: s3
+  oci_repository: ""
   s3_prefix: stack
   # releases/<tag> and the current symlink
   dir: /opt/mystore/stack

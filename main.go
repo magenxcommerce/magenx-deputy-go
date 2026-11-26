@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -45,24 +46,35 @@ type Config struct {
 	HealthCheck                HealthCheck    `json:"health_check" yaml:"health_check"`
 	SharedLinks                []SharedTarget `json:"shared_links" yaml:"shared_links"`
 	Stack                      StackConfig    `json:"stack" yaml:"stack"`
+	// OCI is the registry login for archives deployed with source oci (code and stack).
+	OCI OCIConfig `json:"oci" yaml:"oci"`
 }
 
 type DeployConfig struct {
-	RootDir            string   `json:"root_dir" yaml:"root_dir"`
-	ReleasesDirName    string   `json:"releases_dir_name" yaml:"releases_dir_name"`
-	CurrentLinkSuffix  string   `json:"current_link_suffix" yaml:"current_link_suffix"`
-	DefaultBrand       string   `json:"default_brand" yaml:"default_brand"`
-	DefaultDomain      string   `json:"default_domain" yaml:"default_domain"`
-	MinimumDiskSpaceGB uint64   `json:"minimum_disk_space_gb" yaml:"minimum_disk_space_gb"`
-	S3Bucket           string   `json:"s3_bucket" yaml:"s3_bucket"`
-	S3BucketPerBrand   bool     `json:"s3_bucket_per_brand" yaml:"s3_bucket_per_brand"`
-	S3Prefix           string   `json:"s3_prefix" yaml:"s3_prefix"`
-	S3Endpoint         string   `json:"s3_endpoint" yaml:"s3_endpoint"`
-	S3Region           string   `json:"s3_region" yaml:"s3_region"`
-	S3UsePathStyle     bool     `json:"s3_use_path_style" yaml:"s3_use_path_style"`
-	LeaderEnvVar       string   `json:"leader_env_var" yaml:"leader_env_var"`
-	LeaderDefault      bool     `json:"leader_default" yaml:"leader_default"`
-	LeaderCommands     []string `json:"leader_commands" yaml:"leader_commands"`
+	RootDir            string `json:"root_dir" yaml:"root_dir"`
+	ReleasesDirName    string `json:"releases_dir_name" yaml:"releases_dir_name"`
+	CurrentLinkSuffix  string `json:"current_link_suffix" yaml:"current_link_suffix"`
+	DefaultBrand       string `json:"default_brand" yaml:"default_brand"`
+	DefaultDomain      string `json:"default_domain" yaml:"default_domain"`
+	MinimumDiskSpaceGB uint64 `json:"minimum_disk_space_gb" yaml:"minimum_disk_space_gb"`
+	// Source of the release archives: s3 (default) or oci. With oci the webhook sends tag (the image tag of
+	// the release in OCIRepository) and artifact_digest (the archive, which is the image's only layer).
+	Source        string `json:"source" yaml:"source"`
+	OCIRepository string `json:"oci_repository" yaml:"oci_repository"`
+	// CosignPublicKey, when set, verifies the signature of the release manifest (source oci) before the
+	// archive is downloaded. Required by bootstrap, which has no webhook digest to rely on.
+	CosignPublicKey  string   `json:"cosign_public_key" yaml:"cosign_public_key"`
+	CosignBinary     string   `json:"cosign_binary" yaml:"cosign_binary"`
+	CosignArgs       []string `json:"cosign_args" yaml:"cosign_args"`
+	S3Bucket         string   `json:"s3_bucket" yaml:"s3_bucket"`
+	S3BucketPerBrand bool     `json:"s3_bucket_per_brand" yaml:"s3_bucket_per_brand"`
+	S3Prefix         string   `json:"s3_prefix" yaml:"s3_prefix"`
+	S3Endpoint       string   `json:"s3_endpoint" yaml:"s3_endpoint"`
+	S3Region         string   `json:"s3_region" yaml:"s3_region"`
+	S3UsePathStyle   bool     `json:"s3_use_path_style" yaml:"s3_use_path_style"`
+	LeaderEnvVar     string   `json:"leader_env_var" yaml:"leader_env_var"`
+	LeaderDefault    bool     `json:"leader_default" yaml:"leader_default"`
+	LeaderCommands   []string `json:"leader_commands" yaml:"leader_commands"`
 	// PreSwitchCommands run on the leader inside the new release before the current symlink switches.
 	PreSwitchCommands []string `json:"pre_switch_commands" yaml:"pre_switch_commands"`
 	// RollbackCommands run on the leader after the current symlink was switched back to the previous release.
@@ -97,7 +109,7 @@ type SharedTarget struct {
 }
 
 type DeployPayload struct {
-	// Kind selects the deployer: "" or "code" for a Magento release from S3, "stack" for a docker stack release.
+	// Kind selects the deployer: "" or "code" for a Magento release, "stack" for a docker stack release.
 	Kind           string `json:"kind" yaml:"kind"`
 	ArtifactName   string `json:"artifact_name" yaml:"artifact_name"`
 	ArtifactDigest string `json:"artifact_digest" yaml:"artifact_digest"`
@@ -105,6 +117,7 @@ type DeployPayload struct {
 	Domain         string `json:"domain" yaml:"domain"`
 	Timestamp      int64  `json:"timestamp" yaml:"timestamp"`
 	// Tag is the release of the docker stack (kind stack): name of the release dir, bundle stack_<tag>.tar.gz.
+	// With source oci it is also the image tag of the release, for code deploys too (release_<tag>.tar.gz).
 	Tag string `json:"tag" yaml:"tag"`
 	// Confirm lists services listed in stack.confirm_services whose image may change with this release.
 	Confirm []string `json:"confirm" yaml:"confirm"`
@@ -149,6 +162,9 @@ func main() {
 		fmt.Printf("magenx-deputy-go %s\n", version.Version)
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "bootstrap" {
+		os.Exit(runBootstrap(os.Args[2:]))
+	}
 
 	configPath := flag.String("config", "config.yaml", "Path to config YAML file")
 	flag.Parse()
@@ -160,28 +176,9 @@ func main() {
 	if cfg.WebhookSecret == "" || cfg.HMACKey == "" {
 		log.Fatal("webhook_secret and hmac_key are required")
 	}
-
-	codeID, err := resolveIdentity(cfg.Deploy.RunAs)
+	server, err := buildServer(cfg)
 	if err != nil {
-		log.Fatalf("deploy.run_as: %v", err)
-	}
-	if codeID.isRoot() && !cfg.Deploy.AllowRootCommands {
-		log.Fatal("deploy commands would run as root: set deploy.run_as to the site user, or deploy.allow_root_commands: true")
-	}
-	server := &Server{cfg: cfg, deployer: &S3MagentoDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv)}}
-	log.Printf("code deploys run as %s", codeID)
-
-	if cfg.Stack.Enabled {
-		stackID, err := resolveIdentity(cfg.Stack.RunAs)
-		if err != nil {
-			log.Fatalf("stack.run_as: %v", err)
-		}
-		stack := newStackDeployer(cfg, newRunner(stackID, cfg.Stack.CommandEnv))
-		if err := stack.checkTools(); err != nil {
-			log.Fatalf("stack: %v", err)
-		}
-		server.stack = stack
-		log.Printf("stack deploys into %s run as %s", cfg.Stack.Dir, stackID)
+		log.Fatal(err)
 	}
 
 	srv := &http.Server{
@@ -193,6 +190,44 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+// buildServer creates the code deployer and, with stack.enabled, the stack deployer.
+func buildServer(cfg Config) (*Server, error) {
+	codeID, err := resolveIdentity(cfg.Deploy.RunAs)
+	if err != nil {
+		return nil, fmt.Errorf("deploy.run_as: %w", err)
+	}
+	if codeID.isRoot() && !cfg.Deploy.AllowRootCommands {
+		return nil, errors.New("deploy commands would run as root: set deploy.run_as to the site user, or deploy.allow_root_commands: true")
+	}
+	// signature checks run as deputy itself: the registry login never reaches the site user
+	ownID, err := currentIdentity()
+	if err != nil {
+		return nil, err
+	}
+	oci := ociClient{cfg: cfg.OCI}
+	code := &S3MagentoDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv), sigRun: newRunner(ownID, nil), oci: oci}
+	if err := code.checkTools(); err != nil {
+		return nil, fmt.Errorf("deploy: %w", err)
+	}
+	server := &Server{cfg: cfg, deployer: code}
+	log.Printf("code deploys from %s run as %s", cfg.Deploy.Source, codeID)
+
+	if cfg.Stack.Enabled {
+		stackID, err := resolveIdentity(cfg.Stack.RunAs)
+		if err != nil {
+			return nil, fmt.Errorf("stack.run_as: %w", err)
+		}
+		stack := newStackDeployer(cfg, newRunner(stackID, cfg.Stack.CommandEnv))
+		stack.sigRun = newRunner(ownID, nil)
+		if err := stack.checkTools(); err != nil {
+			return nil, fmt.Errorf("stack: %w", err)
+		}
+		server.stack = stack
+		log.Printf("stack deploys from %s into %s run as %s", cfg.Stack.Source, cfg.Stack.Dir, stackID)
+	}
+	return server, nil
 }
 
 func loadConfig(path string) (Config, error) {
@@ -242,6 +277,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Deploy.S3Prefix == "" {
 		c.Deploy.S3Prefix = "releases"
+	}
+	if c.Deploy.Source == "" {
+		c.Deploy.Source = sourceS3
+	}
+	if c.Deploy.CosignBinary == "" {
+		c.Deploy.CosignBinary = "cosign"
+	}
+	if c.Deploy.CosignArgs == nil {
+		// the release workflows sign without transparency log entry
+		c.Deploy.CosignArgs = []string{"--insecure-ignore-tlog=true"}
+	}
+	if c.OCI.PasswordEnv == "" {
+		c.OCI.PasswordEnv = "REGISTRY_PASSWORD"
 	}
 	if c.Deploy.S3Region == "" {
 		c.Deploy.S3Region = "us-east-1"
@@ -372,8 +420,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // validateCodePayload fills brand and domain from the defaults and returns an error message, or "".
 func (s *Server) validateCodePayload(payload *DeployPayload) string {
-	if payload.Tag != "" || len(payload.Confirm) > 0 {
-		return "tag and confirm are only valid with kind stack"
+	if len(payload.Confirm) > 0 {
+		return "confirm is only valid with kind stack"
+	}
+	if s.cfg.Deploy.Source == sourceOCI {
+		if !isSafeName(payload.Tag) {
+			return "tag is required with deploy.source oci and must match [A-Za-z0-9][A-Za-z0-9._+-]* without \"..\""
+		}
+		if payload.ArtifactName == "" {
+			payload.ArtifactName = codeArtifactName(payload.Tag)
+		}
+	} else if payload.Tag != "" {
+		return "tag is only valid with kind stack, or deploy.source oci"
 	}
 	brand, err := requireMatchOrEmpty(payload.Brand, s.cfg.Deploy.DefaultBrand)
 	if err != nil {
@@ -423,8 +481,36 @@ type S3MagentoDeployer struct {
 	cfg Config
 	// run starts commands and tar as deploy.run_as; files deputy creates are handed to that user.
 	run Runner
-	// download fetches the artifact to destination and returns its digest; nil uses S3.
+	// download fetches the artifact to destination and returns its digest; nil uses deploy.source.
 	download func(ctx context.Context, brand, artifact, destination string) (string, error)
+	// oci pulls archives with source oci; sigRun runs cosign as deputy's own user.
+	oci    ociClient
+	sigRun Runner
+}
+
+// codeArtifactName is the archive name of a code release tag with source oci; the release dir is the tag.
+func codeArtifactName(tag string) string { return "release_" + tag + ".tar.gz" }
+
+// checkTools fails early when cosign or the public key for code signatures are missing.
+func (d *S3MagentoDeployer) checkTools() error {
+	if d.cfg.Deploy.CosignPublicKey == "" {
+		return nil
+	}
+	if _, err := exec.LookPath(d.cfg.Deploy.CosignBinary); err != nil {
+		return fmt.Errorf("%s not found: %w", d.cfg.Deploy.CosignBinary, err)
+	}
+	if _, err := os.Stat(d.cfg.Deploy.CosignPublicKey); err != nil {
+		return fmt.Errorf("cosign public key: %w", err)
+	}
+	return nil
+}
+
+// verifySignature checks the cosign signature of a release manifest when deploy.cosign_public_key is set.
+func (d *S3MagentoDeployer) verifySignature(ctx context.Context, a ociArtifact) error {
+	if d.cfg.Deploy.CosignPublicKey == "" {
+		return nil
+	}
+	return d.oci.cosignVerifyManifest(ctx, d.sigRun, d.cfg.Deploy.CosignBinary, d.cfg.Deploy.CosignPublicKey, d.cfg.Deploy.CosignArgs, a)
 }
 
 func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
@@ -464,7 +550,11 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, artifactDigest, releasesDir, releaseVersion)
+	tag := logSafe(payload.Tag)
+	if d.cfg.Deploy.Source == sourceOCI && !isSafeName(tag) {
+		return fmt.Errorf("invalid tag %q", tag)
+	}
+	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, artifactDigest, releasesDir, releaseVersion, tag)
 	if err != nil {
 		return err
 	}
@@ -521,7 +611,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 // prepareRelease downloads, verifies and extracts the artifact into a staging directory, then renames it
 // to a release directory that did not exist before. An existing (possibly live) release is never touched.
 // On error nothing is left behind.
-func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactFile, artifactDigest, releasesDir, releaseVersion string) (releaseDir string, err error) {
+func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactFile, artifactDigest, releasesDir, releaseVersion, tag string) (releaseDir string, err error) {
 	stagingDir, err := makeStagingDir(d.run.ID, releasesDir, releaseVersion)
 	if err != nil {
 		return "", err
@@ -538,7 +628,13 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactF
 
 	artifactPath := filepath.Join(stagingDir, artifactFile)
 	download := d.download
-	if download == nil {
+	switch {
+	case download != nil:
+	case d.cfg.Deploy.Source == sourceOCI:
+		download = func(ctx context.Context, _, _, destination string) (string, error) {
+			return d.oci.fetch(ctx, d.cfg.Deploy.OCIRepository, tag, artifactDigest, destination, d.verifySignature)
+		}
+	default:
 		download = d.downloadArtifact
 	}
 	actualDigest, err := download(ctx, brand, artifactFile, artifactPath)
@@ -976,7 +1072,15 @@ func (c Config) validate() error {
 			return errors.New("deploy.s3_endpoint must be a valid http/https URL")
 		}
 	}
-	if c.Stack.Enabled && !c.Deploy.S3BucketPerBrand && c.Deploy.S3Bucket == "" {
+	if err := validateSource("deploy.source", c.Deploy.Source); err != nil {
+		return err
+	}
+	if c.Deploy.Source == sourceOCI {
+		if err := validateOCIRepository("deploy.oci_repository", c.Deploy.OCIRepository); err != nil {
+			return err
+		}
+	}
+	if c.Stack.Enabled && c.Stack.Source == sourceS3 && !c.Deploy.S3BucketPerBrand && c.Deploy.S3Bucket == "" {
 		return errors.New("stack deploys download from S3: set deploy.s3_bucket or deploy.s3_bucket_per_brand")
 	}
 	return c.Stack.validate()
