@@ -45,7 +45,8 @@ ProtectSystem=strict
 # Allow write only where deputy needs to act.
 # Adjust to <deploy.root_dir>/<brand> and stack.dir in /etc/magenx-deputy-go/config.yaml.
 # ~/.docker (docker login) and ~/.sigstore (cosign) of the stack.run_as user, "-" = optional.
-ReadWritePaths=/home/mystore -/opt/mystore -/root/.docker -/root/.sigstore
+# /run/<brand>-secrets: tmpfs of the SOPS secrets that stack commands decrypt (scripts/secrets.sh).
+ReadWritePaths=/home/mystore -/opt/mystore -/root/.docker -/root/.sigstore -/run/mystore-secrets
 
 [Install]
 WantedBy=multi-user.target

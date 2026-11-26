@@ -116,6 +116,13 @@ stack:
   pre_up_commands: []
   post_up_commands: []
   rollback_commands: []
+  # In the previous release when a deploy fails after pre_up_commands started: before its "up" on a
+  # rollback, and after a failure before the switch. Undo here what pre_up_commands changed outside the
+  # release, e.g. SOPS secrets of the docker repository decrypted to tmpfs:
+  #   pre_up_commands: ["bash scripts/secrets.sh decrypt"]
+  #   restore_commands: ["bash scripts/secrets.sh decrypt"]
+  #   command_env: ["SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt"]
+  restore_commands: []
   # checked after "up" with health_check attempts, timeout and expected_status
   health_check_url: ""
   wait_timeout_seconds: 600
