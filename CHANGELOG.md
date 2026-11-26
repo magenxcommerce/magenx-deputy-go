@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.0-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.3...v2.1.0-rc) (2026-11-26)
+
+
+### 🚀 Features
+
+* OCI registry source and bootstrap command ([#56](https://github.com/magenxcommerce/magenx-deputy-go/issues/56)) ([968dc08](https://github.com/magenxcommerce/magenx-deputy-go/commit/968dc084343861efbc56ed1a38cb6862d66e4b5c))
+* Restore commands for failed stack deploys ([#54](https://github.com/magenxcommerce/magenx-deputy-go/issues/54)) ([3fb2689](https://github.com/magenxcommerce/magenx-deputy-go/commit/3fb2689b1295d10ea1bbb334e0b83c910d72d26e))
+
 ## [2.0.3](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.0.2...v2.0.3) (2026-11-12)
 
 
