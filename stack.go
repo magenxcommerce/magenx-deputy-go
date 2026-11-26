@@ -22,12 +22,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// StackConfig deploys a docker compose stack from a release bundle in S3: the repository at the release
-// tag plus docker-compose.release.yml, which pins every image by digest. The release workflow uploads
-// stack_<tag>.tar.gz and its cosign signature, then sends the webhook. Bucket, endpoint and region come
-// from the deploy section.
+// StackConfig deploys a docker compose stack from a release bundle: the repository at the release tag plus
+// docker-compose.release.yml, which pins every image by digest. With source s3 the release workflow uploads
+// stack_<tag>.tar.gz and its cosign signature (sign-blob) to the deploy bucket; with source oci it pushes the
+// bundle as the only layer of <oci_repository>:<tag> and signs that manifest. Then it sends the webhook.
 type StackConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
+	// Source of the bundles: s3 (default) or oci.
+	Source        string `json:"source" yaml:"source"`
+	OCIRepository string `json:"oci_repository" yaml:"oci_repository"`
 	// S3Prefix is the key prefix of the bundles in the deploy bucket.
 	S3Prefix string `json:"s3_prefix" yaml:"s3_prefix"`
 	// Dir holds releases/<tag> and the current symlink.
@@ -41,7 +44,8 @@ type StackConfig struct {
 	// CosignPublicKey is the trust anchor for the bundle and every image. It is never taken from the bundle.
 	CosignPublicKey string   `json:"cosign_public_key" yaml:"cosign_public_key"`
 	CosignArgs      []string `json:"cosign_args" yaml:"cosign_args"`
-	// AllowUnsignedBundle skips the bundle signature (<bundle>.sig in S3); images are always verified.
+	// AllowUnsignedBundle skips the bundle signature (<bundle>.sig in S3, the manifest signature with source
+	// oci); images are always verified.
 	AllowUnsignedBundle bool `json:"allow_unsigned_bundle" yaml:"allow_unsigned_bundle"`
 	RequireSBOM         bool `json:"require_sbom" yaml:"require_sbom"`
 	// Registry login before pulling: password from the environment variable named by RegistryLoginEnv
@@ -96,6 +100,9 @@ const stackTagFile = ".deputy-release"
 func stackBundleName(tag string) string { return "stack_" + tag + ".tar.gz" }
 
 func (c *StackConfig) applyDefaults(brand string) {
+	if c.Source == "" {
+		c.Source = sourceS3
+	}
 	if c.S3Prefix == "" {
 		c.S3Prefix = "stack"
 	}
@@ -153,6 +160,14 @@ func (c StackConfig) validate() error {
 	}
 	if !filepath.IsAbs(c.Dir) {
 		return errors.New("stack.dir must be an absolute path")
+	}
+	if err := validateSource("stack.source", c.Source); err != nil {
+		return err
+	}
+	if c.Source == sourceOCI {
+		if err := validateOCIRepository("stack.oci_repository", c.OCIRepository); err != nil {
+			return err
+		}
 	}
 	if !projectPattern.MatchString(c.ProjectName) {
 		return errors.New("stack.project_name must match [a-z0-9][a-z0-9_-]*")
@@ -219,10 +234,13 @@ type StackDeployer struct {
 	run    Runner
 	// download fetches an S3 object of the stack prefix and returns its digest; nil uses S3.
 	download func(ctx context.Context, name, destination string) (string, error)
+	// oci pulls bundles with source oci; sigRun runs cosign on the bundle manifest as deputy's own user.
+	oci    ociClient
+	sigRun Runner
 }
 
 func newStackDeployer(cfg Config, run Runner) *StackDeployer {
-	return &StackDeployer{cfg: cfg.Stack, deploy: cfg.Deploy, hc: cfg.HealthCheck, run: run}
+	return &StackDeployer{cfg: cfg.Stack, deploy: cfg.Deploy, hc: cfg.HealthCheck, run: run, oci: ociClient{cfg: cfg.OCI}, sigRun: run}
 }
 
 // checkTools fails early when docker, cosign or the public key are missing.
@@ -386,16 +404,33 @@ func (d *StackDeployer) prepareRelease(ctx context.Context, tag, name, artifactD
 	}
 	defer os.RemoveAll(filepath.Dir(bundle))
 
-	digest, err := d.fetch(ctx, name, bundle)
-	if err != nil {
-		return "", err
-	}
-	if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
-		return "", err
-	}
-	if !d.cfg.AllowUnsignedBundle {
-		if err := d.verifyBundle(ctx, name, bundle); err != nil {
+	if d.cfg.Source == sourceOCI {
+		// the manifest signature is checked before the download, the layer against artifact_digest
+		var verify func(context.Context, ociArtifact) error
+		if !d.cfg.AllowUnsignedBundle {
+			verify = func(ctx context.Context, a ociArtifact) error {
+				return d.oci.cosignVerifyManifest(ctx, d.sigRun, d.cfg.CosignBinary, d.cfg.CosignPublicKey, d.cfg.CosignArgs, a)
+			}
+		}
+		digest, err := d.oci.fetch(ctx, d.cfg.OCIRepository, tag, artifactDigest, bundle, verify)
+		if err != nil {
 			return "", err
+		}
+		if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
+			return "", err
+		}
+	} else {
+		digest, err := d.fetch(ctx, name, bundle)
+		if err != nil {
+			return "", err
+		}
+		if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
+			return "", err
+		}
+		if !d.cfg.AllowUnsignedBundle {
+			if err := d.verifyBundle(ctx, name, bundle); err != nil {
+				return "", err
+			}
 		}
 	}
 	if err := d.run.ID.own(bundle); err != nil {
