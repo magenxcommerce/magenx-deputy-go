@@ -488,3 +488,56 @@ func TestLogSafe(t *testing.T) {
 		t.Fatalf("logSafe=%q", got)
 	}
 }
+
+func TestDeployCommandsRunAsCommandsRunner(t *testing.T) {
+	env := newTestEnv(t)
+	id, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the runners differ by one variable: files (tar) use run, the commands cmd
+	env.deployer.run = newRunner(id, []string{"DEPUTY_TEST_RUNNER=files"})
+	cmd := newRunner(id, []string{"DEPUTY_TEST_RUNNER=commands"})
+	env.deployer.cmd = &cmd
+	if err := env.deploy("release_v1.0.0.tar.gz", map[string]string{"index.php": "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(env.root, "runner")
+	record := "echo \"$DEPUTY_TEST_RUNNER\" >> " + shellQuote(marker)
+	env.deployer.cfg.Deploy.PreSwitchCommands = []string{record}
+	env.deployer.cfg.Deploy.LeaderCommands = []string{record + " && exit 3"}
+	env.deployer.cfg.Deploy.RollbackCommands = []string{record}
+
+	if err := env.deploy("release_v2.0.0.tar.gz", map[string]string{"index.php": "v2"}); err == nil {
+		t.Fatal("deploy succeeded although the leader command failed")
+	}
+	if got := strings.Fields(readFile(t, marker)); strings.Join(got, " ") != "commands commands commands" {
+		t.Fatalf("pre-switch, leader and rollback ran with %v, want the commands runner each time", got)
+	}
+}
+
+func TestBuildServerCommandsRunAs(t *testing.T) {
+	cfg := Config{Deploy: DeployConfig{RootDir: t.TempDir(), DefaultBrand: "demo", DefaultDomain: "shop.example"}}
+	cfg.applyDefaults()
+	if os.Geteuid() != 0 {
+		// another user than the process user needs root
+		cfg.Deploy.CommandsRunAs = "root"
+		if _, err := buildServer(cfg); err == nil || !strings.Contains(err.Error(), "deploy.commands_run_as") {
+			t.Fatalf("commands_run_as root without root: %v", err)
+		}
+		return
+	}
+	// deputy runs as root here: run_as and commands_run_as root need allow_root_commands
+	cfg.Deploy.CommandsRunAs = "root"
+	if _, err := buildServer(cfg); err == nil || !strings.Contains(err.Error(), "allow_root_commands") {
+		t.Fatalf("root commands without allow_root_commands: %v", err)
+	}
+	cfg.Deploy.AllowRootCommands = true
+	s, err := buildServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := s.deployer.(*S3MagentoDeployer); d.cmd == nil || !d.commands().ID.isRoot() {
+		t.Fatalf("commands runner %+v, want root", d.cmd)
+	}
+}

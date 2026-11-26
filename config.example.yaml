@@ -55,10 +55,13 @@ deploy:
   # Empty = the deputy process user. Deputy must run as root to use another user.
   # Docker host with userns-remap: the host uid of the container user, e.g. "165532:165532".
   run_as: mystore
+  # The commands only (pre_switch, leader, rollback) as another user, run_as still owns the release files.
+  # Empty = run_as. Docker host: "root" with allow_root_commands, for "docker compose run ... bin/magento".
+  commands_run_as: ""
   # Commands get a clean environment (HOME, USER, LOGNAME, PATH) plus these:
   # KEY=VALUE, or NAME to pass deputy's own value of NAME. S3 keys and the registry password are never passed.
   command_env: []
-  # Commands as root (run_as root, or no run_as while deputy runs as root) are refused unless true.
+  # Commands as root (commands_run_as or run_as root, or neither while deputy runs as root) are refused unless true.
   allow_root_commands: false
 
 health_check:

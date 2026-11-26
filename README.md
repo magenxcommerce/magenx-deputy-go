@@ -47,7 +47,8 @@ Optional `/etc/magenx-deputy-go/env` (mode 0600) is loaded as `EnvironmentFile`,
 | Step | Runs as |
 |---|---|
 | webhook, HMAC, S3 and registry downloads, digest checks, `cosign` on code and OCI bundle manifests, symlink switch, prune | deputy (root) |
-| tar extraction, `pre_switch_commands`, `leader_commands`, `rollback_commands` | `deploy.run_as` |
+| tar extraction, release files | `deploy.run_as` |
+| `pre_switch_commands`, `leader_commands`, `rollback_commands` | `deploy.commands_run_as` (empty = `deploy.run_as`) |
 | `docker`, `cosign`, stack tar extraction and stack commands | `stack.run_as` (empty = deputy) |
 
 - Files and links deputy creates as root are handed to the `run_as` user.
@@ -116,7 +117,7 @@ It is required unless `allow_missing_artifact_digest: true` is set; a digest tha
 9. runs the health check (`attempts`, `retry_interval_seconds`)
 10. prunes releases beyond `keep_releases` (never the new or previous one) and leftover staging dirs
 
-Commands run with `/bin/sh -c` as `deploy.run_as` in the release dir; `{release_dir}` is replaced by the
+Commands run with `/bin/sh -c` as `deploy.commands_run_as` (default `deploy.run_as`) in the release dir; `{release_dir}` is replaced by the
 shell-quoted release path and exported as `RELEASE_DIR`. The deploy runs to completion (or `deployment_timeout_seconds`)
 even if the webhook client disconnects. The webhook answers after the deploy finished: `200 ok` or `500`
 with the error.
@@ -212,6 +213,23 @@ read-only for deputy.
 
 Rolling back images does not roll back data: a MariaDB or OpenSearch major upgrade rewrites its volume.
 List such services in `confirm_services` and take a backup (e.g. in `pre_up_commands`) before you confirm.
+
+### Docker hosts
+
+On a docker host the release files belong to the container user (userns-remap: `run_as: "165532:165532"`),
+who has no docker access, while `bin/magento` must run in a container. `commands_run_as: root` with
+`allow_root_commands: true` runs the commands as root, the files stay owned by `run_as`:
+
+```yaml
+deploy:
+  run_as: "165532:165532"
+  commands_run_as: root
+  allow_root_commands: true
+  pre_switch_commands:
+    - docker compose -p mystore -f /opt/mystore/stack/current/docker-compose.yml run --rm --no-deps -w {release_dir} magento setup:upgrade --keep-generated
+```
+
+Root commands run with the same rights as the stack commands (`stack.run_as` empty): the docker socket.
 
 ## OCI registry source
 

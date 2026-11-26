@@ -85,10 +85,14 @@ type DeployConfig struct {
 	// RunAs is the user ("user", "user:group", "uid", "uid:gid") that owns the releases and runs the commands.
 	// Empty is the deputy process user. Another user needs deputy to run as root.
 	RunAs string `json:"run_as" yaml:"run_as"`
+	// CommandsRunAs runs pre_switch_commands, leader_commands and rollback_commands as another user than
+	// run_as, which still owns the release files, e.g. root for commands that need docker. Empty is run_as.
+	CommandsRunAs string `json:"commands_run_as" yaml:"commands_run_as"`
 	// CommandEnv is passed to commands: KEY=VALUE, or NAME to pass deputy's own value of NAME.
 	// Commands do not inherit the deputy environment.
 	CommandEnv []string `json:"command_env" yaml:"command_env"`
-	// AllowRootCommands permits commands to run as root (run_as root, or empty while deputy runs as root).
+	// AllowRootCommands permits commands to run as root (commands_run_as or run_as root, or empty while deputy
+	// runs as root).
 	AllowRootCommands bool `json:"allow_root_commands" yaml:"allow_root_commands"`
 }
 
@@ -198,8 +202,14 @@ func buildServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("deploy.run_as: %w", err)
 	}
-	if codeID.isRoot() && !cfg.Deploy.AllowRootCommands {
-		return nil, errors.New("deploy commands would run as root: set deploy.run_as to the site user, or deploy.allow_root_commands: true")
+	cmdID := codeID
+	if cfg.Deploy.CommandsRunAs != "" {
+		if cmdID, err = resolveIdentity(cfg.Deploy.CommandsRunAs); err != nil {
+			return nil, fmt.Errorf("deploy.commands_run_as: %w", err)
+		}
+	}
+	if cmdID.isRoot() && !cfg.Deploy.AllowRootCommands {
+		return nil, errors.New("deploy commands would run as root: set deploy.run_as (or deploy.commands_run_as) to the site user, or deploy.allow_root_commands: true")
 	}
 	// signature checks run as deputy itself: the registry login never reaches the site user
 	ownID, err := currentIdentity()
@@ -208,11 +218,15 @@ func buildServer(cfg Config) (*Server, error) {
 	}
 	oci := ociClient{cfg: cfg.OCI}
 	code := &S3MagentoDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv), sigRun: newRunner(ownID, nil), oci: oci}
+	if cfg.Deploy.CommandsRunAs != "" {
+		cmd := newRunner(cmdID, cfg.Deploy.CommandEnv)
+		code.cmd = &cmd
+	}
 	if err := code.checkTools(); err != nil {
 		return nil, fmt.Errorf("deploy: %w", err)
 	}
 	server := &Server{cfg: cfg, deployer: code}
-	log.Printf("code deploys from %s run as %s", cfg.Deploy.Source, codeID)
+	log.Printf("code deploys from %s owned by %s, commands run as %s", cfg.Deploy.Source, codeID, cmdID)
 
 	if cfg.Stack.Enabled {
 		stackID, err := resolveIdentity(cfg.Stack.RunAs)
@@ -481,11 +495,21 @@ type S3MagentoDeployer struct {
 	cfg Config
 	// run starts commands and tar as deploy.run_as; files deputy creates are handed to that user.
 	run Runner
+	// cmd runs the commands instead of run when deploy.commands_run_as is set.
+	cmd *Runner
 	// download fetches the artifact to destination and returns its digest; nil uses deploy.source.
 	download func(ctx context.Context, brand, artifact, destination string) (string, error)
 	// oci pulls archives with source oci; sigRun runs cosign as deputy's own user.
 	oci    ociClient
 	sigRun Runner
+}
+
+// commands is the runner of pre_switch_commands, leader_commands and rollback_commands.
+func (d *S3MagentoDeployer) commands() Runner {
+	if d.cmd != nil {
+		return *d.cmd
+	}
+	return d.run
 }
 
 // codeArtifactName is the archive name of a code release tag with source oci; the release dir is the tag.
@@ -562,7 +586,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 	// Pre-switch: the old release keeps serving (e.g. setup:upgrade with deployment/blue_green enabled).
 	if d.isLeader() {
 		for _, command := range d.cfg.Deploy.PreSwitchCommands {
-			if err := d.run.Shell(ctx, command, releaseDir); err != nil {
+			if err := d.commands().Shell(ctx, command, releaseDir); err != nil {
 				_ = os.RemoveAll(releaseDir)
 				return fmt.Errorf("pre-switch command failed: %w", err)
 			}
@@ -589,7 +613,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 
 	if d.isLeader() {
 		for _, command := range d.cfg.Deploy.LeaderCommands {
-			if err := d.run.Shell(ctx, command, releaseDir); err != nil {
+			if err := d.commands().Shell(ctx, command, releaseDir); err != nil {
 				return fmt.Errorf("leader command failed: %w", err)
 			}
 		}
@@ -690,7 +714,7 @@ func (d *S3MagentoDeployer) rollback(previousRelease, currentLink string) error 
 	defer cancel()
 	var errs []error
 	for _, command := range d.cfg.Deploy.RollbackCommands {
-		if err := d.run.Shell(ctx, command, previousRelease); err != nil {
+		if err := d.commands().Shell(ctx, command, previousRelease); err != nil {
 			log.Printf("rollback: command failed: %v", err)
 			errs = append(errs, fmt.Errorf("rollback command failed: %w", err))
 		}
