@@ -69,6 +69,7 @@ func runBootstrap(args []string) int {
 		log.Printf("bootstrap: %v", err)
 		return 1
 	}
+	server.lockPath = *configPath
 	if err := bootstrap(context.Background(), cfg, server, opts); err != nil {
 		log.Printf("bootstrap: %v", err)
 		return 1

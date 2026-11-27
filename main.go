@@ -143,6 +143,8 @@ type Server struct {
 	mu sync.Mutex
 	// watch is nil without watch.enabled.
 	watch *watcher
+	// lockPath is the file lockDeploys flocks across processes: the config file; empty takes only mu.
+	lockPath string
 }
 
 var (
@@ -190,6 +192,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	server.lockPath = *configPath
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

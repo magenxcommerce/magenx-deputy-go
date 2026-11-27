@@ -3,24 +3,19 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
-// deployLockName is the lock file in <deploy.root_dir>/<brand>: the service (webhook, watch) and bootstrap run as
-// separate processes and must never deploy at the same time.
-const deployLockName = ".deputy.lock"
-
-// lockDeploys serializes deploys inside this process (s.mu) and across processes (flock on the lock file). It
-// waits for a running deploy and returns the function that releases both.
+// lockDeploys serializes deploys inside this process (s.mu) and across processes: the service (webhook, watch)
+// and bootstrap run separately, so they also take an flock on the config file they both read. The file is opened
+// read-only (the service sees /etc read-only), and no directory is created for it. Without lockPath (tests) only
+// the mutex is taken. It waits for a running deploy and returns the function that releases the lock.
 func (s *Server) lockDeploys() (func(), error) {
 	s.mu.Lock()
-	dir := filepath.Join(s.cfg.Deploy.RootDir, s.cfg.Deploy.DefaultBrand)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("deploy lock: %w", err)
+	if s.lockPath == "" {
+		return s.mu.Unlock, nil
 	}
-	f, err := os.OpenFile(filepath.Join(dir, deployLockName), os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.Open(s.lockPath)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("deploy lock: %w", err)
@@ -28,7 +23,7 @@ func (s *Server) lockDeploys() (func(), error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		_ = f.Close()
 		s.mu.Unlock()
-		return nil, fmt.Errorf("deploy lock: %w", err)
+		return nil, fmt.Errorf("deploy lock %s: %w", s.lockPath, err)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
