@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -48,6 +49,8 @@ type Config struct {
 	Stack                      StackConfig    `json:"stack" yaml:"stack"`
 	// OCI is the registry login for archives deployed with source oci (code and stack).
 	OCI OCIConfig `json:"oci" yaml:"oci"`
+	// Watch deploys what moving tags point to, without a webhook.
+	Watch WatchConfig `json:"watch" yaml:"watch"`
 }
 
 type DeployConfig struct {
@@ -136,8 +139,10 @@ type Server struct {
 	deployer Deployer
 	// stack is nil when stack.enabled is false.
 	stack Deployer
-	// mu serializes all deploys, code and stack.
+	// mu serializes all deploys, code and stack; lockDeploys takes it.
 	mu sync.Mutex
+	// watch is nil without watch.enabled.
+	watch *watcher
 }
 
 var (
@@ -177,20 +182,42 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
-	if cfg.WebhookSecret == "" || cfg.HMACKey == "" {
-		log.Fatal("webhook_secret and hmac_key are required")
+	// bootstrap needs neither, the service at least one
+	if !cfg.webhookEnabled() && !cfg.Watch.Enabled {
+		log.Fatal("nothing to do: set webhook_secret and hmac_key for the webhook, or watch.enabled")
 	}
 	server, err := buildServer(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: server,
+	if cfg.Watch.Enabled {
+		server.watch = newWatcher(cfg, server)
+		if !cfg.listens() {
+			// no inbound port at all: the registry is only polled
+			server.watch.run(ctx)
+			return
+		}
+		go server.watch.run(ctx)
 	}
 
-	log.Printf("listening on %s%s", cfg.ListenAddr, cfg.WebhookPath)
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           server,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	if cfg.webhookEnabled() {
+		log.Printf("webhook on %s%s", cfg.ListenAddr, cfg.WebhookPath)
+	}
+	if cfg.Watch.Enabled {
+		log.Printf("watch endpoints on %s: check %q, status %q", cfg.ListenAddr, endpoint(cfg.Watch.CheckPath), endpoint(cfg.Watch.StatusPath))
+	}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server failed: %v", err)
 	}
@@ -342,9 +369,23 @@ func (c *Config) applyDefaults() {
 		c.HealthCheck.RetryIntervalSeconds = 5
 	}
 	c.Stack.applyDefaults(c.Deploy.DefaultBrand)
+	c.Watch.applyDefaults()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch path := r.URL.Path; {
+	case s.watch != nil && path == endpoint(s.cfg.Watch.CheckPath):
+		s.watch.serveCheck(w, r)
+	case s.watch != nil && path == endpoint(s.cfg.Watch.StatusPath):
+		s.watch.serveStatus(w, r)
+	case s.cfg.webhookEnabled() && path == s.cfg.WebhookPath:
+		s.serveWebhook(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) serveWebhook(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	if r.URL.Path != s.cfg.WebhookPath {
 		http.NotFound(w, r)
@@ -416,8 +457,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockDeploys()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
 
 	// Detached from the request: a dropped client connection must not kill bin/magento mid-run.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
@@ -788,10 +833,13 @@ func pruneReleases(releasesDir string, keep int, protected ...string) error {
 	return errors.Join(errs...)
 }
 
-func (d *S3MagentoDeployer) isLeader() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv(d.cfg.Deploy.LeaderEnvVar)))
+func (d *S3MagentoDeployer) isLeader() bool { return leaderFromEnv(d.cfg.Deploy) }
+
+// leaderFromEnv reports whether this server is the leader: the variable leader_env_var, else leader_default.
+func leaderFromEnv(dc DeployConfig) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(dc.LeaderEnvVar)))
 	if value == "" {
-		return d.cfg.Deploy.LeaderDefault
+		return dc.LeaderDefault
 	}
 	return value == "1" || value == "true" || value == "yes"
 }
@@ -1107,5 +1155,19 @@ func (c Config) validate() error {
 	if c.Stack.Enabled && c.Stack.Source == sourceS3 && !c.Deploy.S3BucketPerBrand && c.Deploy.S3Bucket == "" {
 		return errors.New("stack deploys download from S3: set deploy.s3_bucket or deploy.s3_bucket_per_brand")
 	}
-	return c.Stack.validate()
+	if (c.WebhookSecret == "") != (c.HMACKey == "") {
+		return errors.New("webhook_secret and hmac_key go together: set both for the webhook, or neither")
+	}
+	if err := c.Stack.validate(); err != nil {
+		return err
+	}
+	return c.Watch.validate(c)
+}
+
+// webhookEnabled: the webhook only runs with both secrets.
+func (c Config) webhookEnabled() bool { return c.WebhookSecret != "" && c.HMACKey != "" }
+
+// listens: the webhook, or watch with its check or status endpoint, needs listen_addr.
+func (c Config) listens() bool {
+	return c.webhookEnabled() || (c.Watch.Enabled && (endpoint(c.Watch.CheckPath) != "" || endpoint(c.Watch.StatusPath) != ""))
 }

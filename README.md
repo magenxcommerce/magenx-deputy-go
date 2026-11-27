@@ -3,7 +3,8 @@
 A small webhook listener + deployer for Magento release archives stored in S3-compatible storage or an OCI
 registry such as ghcr.io, and for docker stack release bundles in the same storage (see
 [Docker stack deploys](#docker-stack-deploys) and [OCI registry source](#oci-registry-source)).
-`magenx-deputy-go bootstrap` deploys both on a new server without a webhook ([Bootstrap](#bootstrap)).
+Instead of the webhook, deputy can follow moving tags in the registry ([Watch](#watch)): no inbound port,
+no webhook secrets. `magenx-deputy-go bootstrap` deploys both once, on a new server ([Bootstrap](#bootstrap)).
 
 ## Build
 
@@ -259,8 +260,9 @@ deputy and `stack.registry_username`). A registry on a loopback or private addre
 
 ## Bootstrap
 
-`magenx-deputy-go bootstrap` deploys the release a moving tag points to, without a webhook: on a new server
-from cloud-init, before the service starts.
+`magenx-deputy-go bootstrap` deploys the release a moving tag points to once, without a webhook: on a new
+server from cloud-init. With [watch](#watch) the service does the same at its start, so bootstrap is only needed
+when the deploy has to be finished before the next cloud-init step.
 
 ```bash
 # the variables of the service's EnvironmentFile: REGISTRY_PASSWORD, IS_LEADER, ...
@@ -269,7 +271,7 @@ magenx-deputy-go bootstrap -config /etc/magenx-deputy-go/config.yaml -tag produc
 systemctl enable --now magenx-deputy-go
 ```
 
-1. refuses to run while `listen_addr` is in use (the service would deploy into the same dirs)
+1. waits for the deploy lock (`<root_dir>/<brand>/.deputy.lock`): bootstrap and a running service take turns
 2. stack (`stack.enabled`): resolves `<stack.oci_repository>:<tag>`, reads the release version from the manifest
    annotation `org.opencontainers.image.version`, then deploys it like a webhook with that version and the
    layer digest: `<repository>:<version>` must hold the same archive, the signature must verify
@@ -281,3 +283,46 @@ Nothing in bootstrap is covered by the webhook HMAC, so the signatures are the t
 
 Flags: `-tag` (default `production`), `-stack-tag`, `-code-tag`, `-skip-stack`, `-skip-code`, and `-confirm mariadb,...`
 for image changes of `confirm_services` on a server that already runs a stack. Exit status 0 on success.
+
+## Watch
+
+With `watch.enabled` the service deploys what the moving tags point to: the release pipeline pushes the image and
+moves the tag (`production`, `staging`), and that is the deploy. Deputy needs no inbound connection, the webhook
+(`webhook_secret`, `hmac_key`) is optional and can stay unset.
+
+```yaml
+watch:
+  enabled: true
+  interval_seconds: 300       # plus up to 10% jitter, at least 30
+  stack_tag: production       # in stack.oci_repository
+  code_tag: production        # in deploy.oci_repository
+  settle_seconds: 0           # servers that are not the leader wait this long for a new Magento release
+  check_path: /check          # POST: check now (no auth, at most every 10s); "-" disables
+  status_path: /status        # GET: deployed versions and the last error as JSON; "-" disables
+```
+
+1. at start and then every interval (or at once on `POST /check`): one `HEAD` request per tag for its manifest digest
+2. an unchanged digest ends the check: no download, no signature check, no deploy
+3. a new digest: resolve the release version (annotation `org.opencontainers.image.version`) and deploy it like
+   [bootstrap](#bootstrap), the stack before the code, with the same signature checks
+4. a deploy that fails is not tried again until the tag moves to another manifest (or deputy restarts), so a broken
+   release is not rolled back on every check; `GET /status` shows `failed_version` and `error`
+5. the registry answers `429`: the tag is checked again after twice the interval, doubling up to one hour
+
+Watch needs what bootstrap needs: source `oci` for code and stack, `deploy.cosign_public_key` and
+`stack.allow_unsigned_bundle: false`. The registry is read with `oci.username` and `REGISTRY_PASSWORD`, a classic PAT
+with `read:packages` of a user that may read only these packages.
+
+Without the webhook and with `check_path` and `status_path` set to `-` deputy opens no port at all. With
+`/check`, the pipeline can ask the servers to look at once after it moved the tag, and poll `/status` until
+`code.version` is the new tag (or `code.failed_version` is):
+
+```json
+{"deputy":"v2.3.0","stack":{"tag":"production","version":"v2.4.0","checked_at":"..."},"code":{"tag":"production","version":"v1.4.0","checked_at":"..."}}
+```
+
+Several servers: the leader (`IS_LEADER=true`) runs `pre_switch_commands` (setup:upgrade). Give the others a
+`settle_seconds` longer than the leader's deploy, so the schema is upgraded before they switch.
+
+The service and `bootstrap` share the deploy lock `<root_dir>/<brand>/.deputy.lock`, so they never deploy at the
+same time.

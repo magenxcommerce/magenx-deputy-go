@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"log"
-	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -437,20 +436,5 @@ func TestBootstrapSkipStack(t *testing.T) {
 	}
 	if e.stackCurrent() != "." && e.stackCurrent() != "" || e.codeCurrent() != "v1" {
 		t.Fatalf("stack=%q code=%q", e.stackCurrent(), e.codeCurrent())
-	}
-}
-
-func TestEnsureWebhookStopped(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if err := ensureWebhookStopped(addr); err == nil || !strings.Contains(err.Error(), "service running") {
-		t.Fatalf("port in use: %v", err)
-	}
-	_ = ln.Close()
-	if err := ensureWebhookStopped(addr); err != nil {
-		t.Fatalf("free port: %v", err)
 	}
 }
