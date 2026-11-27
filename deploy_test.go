@@ -51,7 +51,7 @@ func digestOf(b []byte) string {
 type testEnv struct {
 	t        *testing.T
 	root     string
-	deployer *S3MagentoDeployer
+	deployer *CodeDeployer
 	archive  []byte
 }
 
@@ -76,8 +76,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env.deployer = &S3MagentoDeployer{cfg: cfg, run: newRunner(id, nil)}
-	env.deployer.download = func(_ context.Context, _, _, destination string) (string, error) {
+	env.deployer = &CodeDeployer{cfg: cfg, run: newRunner(id, nil)}
+	env.deployer.download = func(_ context.Context, _, destination string) (string, error) {
 		if err := os.WriteFile(destination, env.archive, 0o640); err != nil {
 			return "", err
 		}
@@ -86,14 +86,14 @@ func newTestEnv(t *testing.T) *testEnv {
 	return env
 }
 
+// tagOf is the release tag of the archive name a release workflow would publish, release_<tag>.tar.gz.
+func tagOf(artifact string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(artifact, "release_"), ".tar.gz")
+}
+
 func (e *testEnv) deploy(artifact string, files map[string]string) error {
 	e.archive = makeTarGz(e.t, files)
-	return e.deployer.Deploy(context.Background(), DeployPayload{
-		ArtifactName:   artifact,
-		ArtifactDigest: digestOf(e.archive),
-		Brand:          "demo",
-		Domain:         "shop.example",
-	})
+	return e.deployer.Deploy(context.Background(), Release{Tag: tagOf(artifact), ArtifactDigest: digestOf(e.archive)})
 }
 
 func (e *testEnv) releasesDir() string { return filepath.Join(e.root, "demo", "releases") }
@@ -261,11 +261,7 @@ func TestDeployExtractFailureLeavesNoStagingDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.archive = []byte("not a tarball")
-	err := env.deployer.Deploy(context.Background(), DeployPayload{
-		ArtifactName:   "release_v2.0.0.tar.gz",
-		ArtifactDigest: digestOf(env.archive),
-		Brand:          "demo",
-	})
+	err := env.deployer.Deploy(context.Background(), Release{Tag: "v2.0.0", ArtifactDigest: digestOf(env.archive)})
 	if err == nil {
 		t.Fatal("expected extract failure")
 	}
@@ -277,11 +273,7 @@ func TestDeployExtractFailureLeavesNoStagingDir(t *testing.T) {
 func TestDeployDigestMismatchLeavesNoStagingDir(t *testing.T) {
 	env := newTestEnv(t)
 	env.archive = makeTarGz(t, map[string]string{"index.php": "v1"})
-	err := env.deployer.Deploy(context.Background(), DeployPayload{
-		ArtifactName:   "release_v1.0.0.tar.gz",
-		ArtifactDigest: "sha256:" + strings.Repeat("0", 64),
-		Brand:          "demo",
-	})
+	err := env.deployer.Deploy(context.Background(), Release{Tag: "v1.0.0", ArtifactDigest: "sha256:" + strings.Repeat("0", 64)})
 	if err == nil || !strings.Contains(err.Error(), "artifact digest mismatch") {
 		t.Fatalf("err=%v", err)
 	}
@@ -362,11 +354,7 @@ func TestDeployHealthCheckRetriesThenRollsBack(t *testing.T) {
 	env.deployer.cfg.HealthCheck.Scheme = "http"
 	env.deployer.cfg.HealthCheck.Attempts = 2
 	deploy := func(artifact string) error {
-		env.archive = makeTarGz(t, map[string]string{"index.php": artifact})
-		// the payload domain is ignored: the health check only goes to deploy.default_domain
-		return env.deployer.Deploy(context.Background(), DeployPayload{
-			ArtifactName: artifact, ArtifactDigest: digestOf(env.archive), Brand: "demo", Domain: "other.example",
-		})
+		return env.deploy(artifact, map[string]string{"index.php": artifact})
 	}
 
 	// first attempt 503, second 200 -> success
@@ -390,43 +378,6 @@ func TestDeployHealthCheckRetriesThenRollsBack(t *testing.T) {
 	}
 }
 
-type ctxDeployer struct{ ctxErr error }
-
-func (c *ctxDeployer) Deploy(ctx context.Context, _ DeployPayload) error {
-	c.ctxErr = ctx.Err()
-	return nil
-}
-
-func TestWebhookDeployNotCancelledByClient(t *testing.T) {
-	now := time.Now().Unix()
-	payload := []byte(`{"artifact_name":"release_2.4.7.tar.gz","artifact_digest":"` + testDigest + `","timestamp":` + strconv.FormatInt(now, 10) + `}`)
-	cfg := Config{
-		WebhookPath:   "/deploy",
-		WebhookSecret: "secret",
-		HMACKey:       "hmac",
-		Deploy:        DeployConfig{DefaultBrand: "demo", DefaultDomain: "shop.example"},
-	}
-	cfg.applyDefaults()
-	deployer := &ctxDeployer{}
-	server := &Server{cfg: cfg, deployer: deployer}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // client already gone
-	req := httptest.NewRequest(http.MethodPost, "/deploy", bytes.NewReader(payload)).WithContext(ctx)
-	req.Header.Set("X-Webhook-Secret", "secret")
-	req.Header.Set("X-Signature", sign("hmac", payload))
-	req.Header.Set("X-Timestamp", strconv.FormatInt(now, 10))
-	res := httptest.NewRecorder()
-	server.ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("status=%d", res.Code)
-	}
-	if deployer.ctxErr != nil {
-		t.Fatalf("deploy context cancelled with client: %v", deployer.ctxErr)
-	}
-}
-
 func TestShellQuote(t *testing.T) {
 	out, err := os.MkdirTemp(t.TempDir(), "it's dir")
 	if err != nil {
@@ -443,7 +394,7 @@ func TestShellQuote(t *testing.T) {
 }
 
 func TestHealthCheckURLHostFromConfig(t *testing.T) {
-	d := &S3MagentoDeployer{cfg: Config{Deploy: DeployConfig{DefaultDomain: "shop.example"}}}
+	d := &CodeDeployer{cfg: Config{Deploy: DeployConfig{DefaultDomain: "shop.example"}}}
 	d.cfg.applyDefaults()
 	for version, want := range map[string]string{
 		"2.4.7":            "https://shop.example/health_check.php?release=2.4.7",
@@ -464,22 +415,27 @@ func TestHealthCheckURLHostFromConfig(t *testing.T) {
 
 func TestDeployRefusesUnsafeNames(t *testing.T) {
 	env := newTestEnv(t)
-	for _, tc := range []struct{ brand, artifact, want string }{
-		{"demo", "...tar.gz", "invalid artifact name"},
-		{"demo", "release_-x.tar.gz", "invalid release version"},
-		{"demo", "release_..tar.gz", "invalid artifact name"},
-		{"demo", "../release_1.tar.gz", "invalid artifact name"},
-		{"demo", "a/release_1.tar.gz", "invalid artifact name"},
-		{"other", "release_1.tar.gz", "does not match deploy.default_brand"},
+	env.archive = makeTarGz(t, map[string]string{"index.php": "x"})
+	digest := digestOf(env.archive)
+	for _, tc := range []struct {
+		rel  Release
+		want string
+	}{
+		{Release{Tag: "", ArtifactDigest: digest}, "invalid tag"},
+		{Release{Tag: "-x", ArtifactDigest: digest}, "invalid tag"},
+		{Release{Tag: "..", ArtifactDigest: digest}, "invalid tag"},
+		{Release{Tag: "../v1", ArtifactDigest: digest}, "invalid tag"},
+		{Release{Tag: "a/v1", ArtifactDigest: digest}, "invalid tag"},
+		{Release{Tag: "v1", ArtifactDigest: ""}, "invalid artifact digest"},
+		{Release{Tag: "v1", ArtifactDigest: "sha512:" + strings.Repeat("0", 128)}, "invalid artifact digest"},
+		{Release{Tag: "v1", ArtifactDigest: digest, Confirm: []string{"mariadb"}}, "only valid for stack"},
 	} {
-		env.archive = makeTarGz(t, map[string]string{"index.php": "x"})
-		err := env.deployer.Deploy(context.Background(), DeployPayload{ArtifactName: tc.artifact, ArtifactDigest: digestOf(env.archive), Brand: tc.brand})
-		if err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s/%s: err=%v want %q", tc.brand, tc.artifact, err, tc.want)
+		if err := env.deployer.Deploy(context.Background(), tc.rel); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%+v: err=%v want %q", tc.rel, err, tc.want)
 		}
 	}
 	if _, err := os.Stat(env.releasesDir()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("releases dir created for refused payloads: %v", err)
+		t.Fatalf("releases dir created for refused releases: %v", err)
 	}
 }
 
@@ -517,7 +473,13 @@ func TestDeployCommandsRunAsCommandsRunner(t *testing.T) {
 }
 
 func TestBuildServerCommandsRunAs(t *testing.T) {
-	cfg := Config{Deploy: DeployConfig{RootDir: t.TempDir(), DefaultBrand: "demo", DefaultDomain: "shop.example"}}
+	fake := t.TempDir()
+	writeFile(t, filepath.Join(fake, "cosign"), fakeCosign, 0o755)
+	writeFile(t, filepath.Join(fake, "cosign.pub"), "-----BEGIN PUBLIC KEY-----\n", 0o644)
+	cfg := Config{Deploy: DeployConfig{
+		RootDir: t.TempDir(), DefaultBrand: "demo", DefaultDomain: "shop.example",
+		CosignBinary: filepath.Join(fake, "cosign"), CosignPublicKey: filepath.Join(fake, "cosign.pub"),
+	}}
 	cfg.applyDefaults()
 	if os.Geteuid() != 0 {
 		// another user than the process user needs root
@@ -537,7 +499,7 @@ func TestBuildServerCommandsRunAs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := s.deployer.(*S3MagentoDeployer); d.cmd == nil || !d.commands().ID.isRoot() {
+	if d := s.deployer.(*CodeDeployer); d.cmd == nil || !d.commands().ID.isRoot() {
 		t.Fatalf("commands runner %+v, want root", d.cmd)
 	}
 }

@@ -1,14 +1,9 @@
+# Deputy deploys what moving tags in an OCI registry point to (watch below, bootstrap). It takes no deploy
+# requests: the cosign signatures are the trust anchor. listen_addr serves POST /check and GET /status.
 listen_addr: 0.0.0.0:8082
-# The webhook runs with both secrets set; leave both empty with watch (below), which needs no webhook.
-webhook_path: /deploy
-webhook_secret: YOUR_WEBHOOK_SECRET_HERE
-hmac_key: YOUR_HMAC_KEY_HERE
-timestamp_window_seconds: 300
 deployment_timeout_seconds: 900
-# artifact_digest (sha256:<hex>) is required in the payload; set true only for senders that cannot provide it
-allow_missing_artifact_digest: false
 
-# Registry login for archives deployed with source oci (code and stack), e.g. ghcr.io.
+# Registry login for the release archives (code and stack), e.g. ghcr.io.
 # Empty username: anonymous pulls (public packages). The password comes from the environment variable
 # password_env (/etc/magenx-deputy-go/env), for ghcr.io a classic PAT with read:packages only.
 oci:
@@ -22,20 +17,11 @@ deploy:
   default_brand: mystore
   default_domain: shop.example.com
   minimum_disk_space_gb: 10
-  s3_bucket: mystore
-  s3_bucket_per_brand: true
-  s3_prefix: releases
-  s3_endpoint: https://s3.example.com
-  s3_region: us-east-1
-  s3_use_path_style: true
-  # s3 (default): release_<version>.tar.gz from the bucket above.
-  # oci: <oci_repository>:<tag>, an image whose only layer is the release archive (crane append), signed with
-  # cosign. Webhook payload: {"tag": "v1.4.0", "artifact_digest": "sha256:<layer digest>"}, the release dir
-  # is the tag. "magenx-deputy-go bootstrap" needs oci.
-  source: s3
-  oci_repository: ""
-  # oci: verify the release manifest signature before the download. Required by bootstrap.
-  cosign_public_key: ""
+  # <oci_repository>:<tag>, an image whose only layer is the release archive (crane append), annotated
+  # org.opencontainers.image.version=<tag> and signed with cosign; the release dir is the tag.
+  oci_repository: ghcr.io/acme/magento-release
+  # Verifies the release manifest signature before the download. Required.
+  cosign_public_key: /etc/magenx-deputy-go/cosign.pub
   leader_env_var: IS_LEADER
   leader_default: true
   # Leader only. {release_dir} = shell-quoted path of the release the command runs for (also $RELEASE_DIR).
@@ -60,7 +46,7 @@ deploy:
   # Empty = run_as. Docker host: "root" with allow_root_commands, for "docker compose run ... bin/magento".
   commands_run_as: ""
   # Commands get a clean environment (HOME, USER, LOGNAME, PATH) plus these:
-  # KEY=VALUE, or NAME to pass deputy's own value of NAME. S3 keys and the registry password are never passed.
+  # KEY=VALUE, or NAME to pass deputy's own value of NAME. The registry password is never passed.
   command_env: []
   # Commands as root (commands_run_as or run_as root, or neither while deputy runs as root) are refused unless true.
   allow_root_commands: false
@@ -91,18 +77,12 @@ shared_links:
 #  - source: /home/mystore/shared/app/etc/env.php
 #    target: app/etc/env.php
 
-# Docker stack releases: stack_<tag>.tar.gz is the repository at the release tag plus
-# docker-compose.release.yml, which pins every image by digest.
-# source s3: the release workflow uploads it and its cosign signature stack_<tag>.tar.gz.sig to
-# <bucket>/<s3_prefix>/; bucket, endpoint, region and credentials are the ones of the deploy section.
-# source oci: the release workflow pushes it as the only layer of <oci_repository>:<tag> and signs that
-# manifest with the key below.
-# Webhook payload: {"kind": "stack", "tag": "v1.11.0", "artifact_digest": "sha256:...", "confirm": ["mariadb"]}
+# Docker stack releases: a bundle of the repository at the release tag plus docker-compose.release.yml, which
+# pins every image by digest. The release workflow pushes it as the only layer of <oci_repository>:<tag> and
+# signs that manifest with the key below.
 stack:
   enabled: false
-  source: s3
-  oci_repository: ""
-  s3_prefix: stack
+  oci_repository: ghcr.io/acme/shop-stack
   # releases/<tag> and the current symlink
   dir: /opt/mystore/stack
   project_name: mystore
@@ -118,8 +98,6 @@ stack:
   # Copy cosign/cosign.pub of the docker repository here.
   cosign_public_key: /etc/magenx-deputy-go/cosign.pub
   cosign_args: ["--insecure-ignore-tlog=true"]
-  # true skips the bundle signature (.sig); image signatures are always checked
-  allow_unsigned_bundle: false
   require_sbom: false
   # "docker login <registry>" before pulling, password from the environment variable registry_password_env
   # (/etc/magenx-deputy-go/env, e.g. a classic PAT with read:packages only).
@@ -132,8 +110,8 @@ stack:
   exclude_services: [magento]
   profiles: []
   remove_orphans: false
-  # An image change of these services needs "confirm": ["<service>"] in the webhook: their data
-  # cannot be rolled back by switching images.
+  # The watch does not deploy an image change of these services: their data cannot be rolled back by
+  # switching images. After a backup: magenx-deputy-go bootstrap -skip-code -stack-tag <tag> -confirm <service>
   confirm_services: [mariadb, opensearch]
   # /bin/sh in a release dir, {release_dir} and $RELEASE_DIR as in deploy commands
   pre_up_commands: []
@@ -157,15 +135,13 @@ stack:
   run_as: ""
   command_env: []
 
-# Deploy what moving tags in the registry point to, instead of (or next to) the webhook. Needs source oci for
-# deploy and stack, deploy.cosign_public_key and stack.allow_unsigned_bundle false. See README, Watch.
+# What the service deploys: the releases the moving tags point to. See README, Watch.
 watch:
-  enabled: false
   interval_seconds: 300
   stack_tag: production
   code_tag: production
   # servers that are not the leader wait this long before they deploy a new Magento release
   settle_seconds: 0
-  # "-" disables an endpoint; without the webhook and both endpoints deputy opens no port
+  # "-" disables an endpoint; without both deputy opens no port
   check_path: /check
   status_path: /status

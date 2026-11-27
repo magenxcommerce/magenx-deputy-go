@@ -23,16 +23,11 @@ import (
 )
 
 // StackConfig deploys a docker compose stack from a release bundle: the repository at the release tag plus
-// docker-compose.release.yml, which pins every image by digest. With source s3 the release workflow uploads
-// stack_<tag>.tar.gz and its cosign signature (sign-blob) to the deploy bucket; with source oci it pushes the
-// bundle as the only layer of <oci_repository>:<tag> and signs that manifest. Then it sends the webhook.
+// docker-compose.release.yml, which pins every image by digest. The release workflow pushes the bundle as the
+// only layer of <oci_repository>:<tag>, signs that manifest and moves the stack tag the watch follows.
 type StackConfig struct {
-	Enabled bool `json:"enabled" yaml:"enabled"`
-	// Source of the bundles: s3 (default) or oci.
-	Source        string `json:"source" yaml:"source"`
+	Enabled       bool   `json:"enabled" yaml:"enabled"`
 	OCIRepository string `json:"oci_repository" yaml:"oci_repository"`
-	// S3Prefix is the key prefix of the bundles in the deploy bucket.
-	S3Prefix string `json:"s3_prefix" yaml:"s3_prefix"`
 	// Dir holds releases/<tag> and the current symlink.
 	Dir         string `json:"dir" yaml:"dir"`
 	ProjectName string `json:"project_name" yaml:"project_name"`
@@ -44,10 +39,7 @@ type StackConfig struct {
 	// CosignPublicKey is the trust anchor for the bundle and every image. It is never taken from the bundle.
 	CosignPublicKey string   `json:"cosign_public_key" yaml:"cosign_public_key"`
 	CosignArgs      []string `json:"cosign_args" yaml:"cosign_args"`
-	// AllowUnsignedBundle skips the bundle signature (<bundle>.sig in S3, the manifest signature with source
-	// oci); images are always verified.
-	AllowUnsignedBundle bool `json:"allow_unsigned_bundle" yaml:"allow_unsigned_bundle"`
-	RequireSBOM         bool `json:"require_sbom" yaml:"require_sbom"`
+	RequireSBOM     bool     `json:"require_sbom" yaml:"require_sbom"`
 	// Registry login before pulling: password from the environment variable named by RegistryLoginEnv
 	// (e.g. a PAT with read:packages for ghcr.io). Empty RegistryUsername: the run_as user is logged in.
 	// RegistryLoginEnv holds only the variable name, so it may appear in errors and logs.
@@ -62,8 +54,8 @@ type StackConfig struct {
 	ExcludeServices []string `json:"exclude_services" yaml:"exclude_services"`
 	Profiles        []string `json:"profiles" yaml:"profiles"`
 	RemoveOrphans   bool     `json:"remove_orphans" yaml:"remove_orphans"`
-	// ConfirmServices only change image when the webhook lists them in "confirm" (e.g. mariadb, opensearch:
-	// a major upgrade rewrites their data and cannot be rolled back by switching images).
+	// ConfirmServices only change image when bootstrap -confirm lists them (e.g. mariadb, opensearch: a major
+	// upgrade rewrites their data and cannot be rolled back by switching images). The watch never confirms.
 	ConfirmServices []string `json:"confirm_services" yaml:"confirm_services"`
 	// Commands run with /bin/sh in a release dir: pre_up in the new release before the switch,
 	// post_up in the new release after "up", rollback in the previous release after switching back.
@@ -123,16 +115,10 @@ func readReleaseFile(releaseDir string) string {
 	return ""
 }
 
-// stackBundleName is the S3 object name of a tag when the webhook does not send artifact_name.
+// stackBundleName is the file name of a downloaded stack bundle.
 func stackBundleName(tag string) string { return "stack_" + tag + ".tar.gz" }
 
 func (c *StackConfig) applyDefaults(brand string) {
-	if c.Source == "" {
-		c.Source = sourceS3
-	}
-	if c.S3Prefix == "" {
-		c.S3Prefix = "stack"
-	}
 	if c.Dir == "" && brand != "" {
 		c.Dir = filepath.Join("/opt", brand, "stack")
 	}
@@ -188,13 +174,8 @@ func (c StackConfig) validate() error {
 	if !filepath.IsAbs(c.Dir) {
 		return errors.New("stack.dir must be an absolute path")
 	}
-	if err := validateSource("stack.source", c.Source); err != nil {
+	if err := validateOCIRepository("stack.oci_repository", c.OCIRepository); err != nil {
 		return err
-	}
-	if c.Source == sourceOCI {
-		if err := validateOCIRepository("stack.oci_repository", c.OCIRepository); err != nil {
-			return err
-		}
 	}
 	if !projectPattern.MatchString(c.ProjectName) {
 		return errors.New("stack.project_name must match [a-z0-9][a-z0-9_-]*")
@@ -225,49 +206,21 @@ func (c StackConfig) validate() error {
 	return nil
 }
 
-// validateStackPayload fills artifact_name from the tag and returns an error message, or "".
-func (s *Server) validateStackPayload(p *DeployPayload) string {
-	if !isSafeName(p.Tag) {
-		return "tag is required with kind stack and must match [A-Za-z0-9][A-Za-z0-9._+-]* without \"..\""
-	}
-	if p.ArtifactName == "" {
-		p.ArtifactName = stackBundleName(p.Tag)
-	}
-	if !artifactPattern.MatchString(p.ArtifactName) || filepath.Base(p.ArtifactName) != p.ArtifactName {
-		return "invalid artifact_name format"
-	}
-	if p.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
-		return "artifact_digest is required"
-	}
-	if p.ArtifactDigest != "" && !digestPattern.MatchString(p.ArtifactDigest) {
-		return "invalid artifact_digest format, expected sha256:<hex>"
-	}
-	if p.Brand != "" && p.Brand != s.cfg.Deploy.DefaultBrand {
-		return "brand does not match configured default"
-	}
-	for _, svc := range p.Confirm {
-		if !servicePattern.MatchString(svc) {
-			return "invalid service name in confirm"
-		}
-	}
-	return ""
-}
-
-// StackDeployer deploys docker stack bundles. It implements Deployer for payloads of kind stack.
+// StackDeployer deploys docker stack bundles.
 type StackDeployer struct {
-	cfg    StackConfig
-	deploy DeployConfig
-	hc     HealthCheck
-	run    Runner
-	// download fetches an S3 object of the stack prefix and returns its digest; nil uses S3.
-	download func(ctx context.Context, name, destination string) (string, error)
-	// oci pulls bundles with source oci; sigRun runs cosign on the bundle manifest as deputy's own user.
+	cfg StackConfig
+	hc  HealthCheck
+	run Runner
+	// download replaces the registry download in tests: writes the bundle of tag to destination and returns
+	// its digest, without the manifest signature check.
+	download func(ctx context.Context, tag, destination string) (string, error)
+	// oci pulls the bundles; sigRun runs cosign on the bundle manifest as deputy's own user.
 	oci    ociClient
 	sigRun Runner
 }
 
 func newStackDeployer(cfg Config, run Runner) *StackDeployer {
-	return &StackDeployer{cfg: cfg.Stack, deploy: cfg.Deploy, hc: cfg.HealthCheck, run: run, oci: ociClient{cfg: cfg.OCI}, sigRun: run}
+	return &StackDeployer{cfg: cfg.Stack, hc: cfg.HealthCheck, run: run, oci: ociClient{cfg: cfg.OCI}, sigRun: run}
 }
 
 // checkTools fails early when docker, cosign or the public key are missing.
@@ -298,26 +251,22 @@ func (d *StackDeployer) currentRelease() (dir, tag string) {
 	return target, readReleaseFile(target)
 }
 
-func (d *StackDeployer) fetch(ctx context.Context, name, destination string) (string, error) {
-	if d.download != nil {
-		return d.download(ctx, name, destination)
-	}
-	return downloadS3(ctx, d.deploy, d.deploy.DefaultBrand, d.cfg.S3Prefix, name, destination)
-}
-
-func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
-	// Paths come from the config and from names checked here; payload fields are not used in paths.
-	tag := logSafe(payload.Tag)
-	if !namePattern.MatchString(tag) || strings.Contains(tag, "..") {
+func (d *StackDeployer) Deploy(ctx context.Context, rel Release) (err error) {
+	// Paths come from the config and from the tag checked here.
+	tag := logSafe(rel.Tag)
+	if !isSafeName(tag) {
 		return fmt.Errorf("invalid tag %q", tag)
 	}
-	name := logSafe(payload.ArtifactName)
-	if name == "" {
-		name = stackBundleName(tag)
+	artifactDigest := logSafe(rel.ArtifactDigest)
+	if !digestPattern.MatchString(artifactDigest) {
+		return fmt.Errorf("invalid artifact digest %q, expected sha256:<hex>", artifactDigest)
 	}
-	if !namePattern.MatchString(name) || strings.Contains(name, "..") {
-		return fmt.Errorf("invalid artifact name %q", name)
+	for _, svc := range rel.Confirm {
+		if !servicePattern.MatchString(svc) {
+			return fmt.Errorf("invalid service name %q in confirm", logSafe(svc))
+		}
 	}
+	name := stackBundleName(tag)
 	previous, previousTag := d.currentRelease()
 	if previousTag == tag {
 		log.Printf("stack %s: already current (%s)", tag, previous)
@@ -338,7 +287,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 		return err
 	}
 
-	releaseDir, err := d.prepareRelease(ctx, tag, name, logSafe(payload.ArtifactDigest))
+	releaseDir, err := d.prepareRelease(ctx, tag, name, artifactDigest)
 	if err != nil {
 		return err
 	}
@@ -357,7 +306,7 @@ func (d *StackDeployer) Deploy(ctx context.Context, payload DeployPayload) (err 
 		err = errors.Join(err, d.rollback(previous, tag))
 	}()
 
-	if err := d.checkConfirm(previous, releaseDir, payload.Confirm); err != nil {
+	if err := d.checkConfirm(previous, releaseDir, rel.Confirm); err != nil {
 		return err
 	}
 	services, err := d.services(ctx, releaseDir)
@@ -430,34 +379,22 @@ func (d *StackDeployer) prepareRelease(ctx context.Context, tag, name, artifactD
 	}
 	defer os.RemoveAll(filepath.Dir(bundle))
 
-	if d.cfg.Source == sourceOCI {
-		// the manifest signature is checked before the download, the layer against artifact_digest
-		var verify func(context.Context, ociArtifact) error
-		if !d.cfg.AllowUnsignedBundle {
-			verify = func(ctx context.Context, a ociArtifact) error {
-				return d.oci.cosignVerifyManifest(ctx, d.sigRun, d.cfg.CosignBinary, d.cfg.CosignPublicKey, d.cfg.CosignArgs, a)
-			}
+	download := d.download
+	if download == nil {
+		// the manifest signature is checked before the download, the layer against artifactDigest
+		verify := func(ctx context.Context, a ociArtifact) error {
+			return d.oci.cosignVerifyManifest(ctx, d.sigRun, d.cfg.CosignBinary, d.cfg.CosignPublicKey, d.cfg.CosignArgs, a)
 		}
-		digest, err := d.oci.fetch(ctx, d.cfg.OCIRepository, tag, artifactDigest, bundle, verify)
-		if err != nil {
-			return "", err
+		download = func(ctx context.Context, tag, destination string) (string, error) {
+			return d.oci.fetch(ctx, d.cfg.OCIRepository, tag, artifactDigest, destination, verify)
 		}
-		if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
-			return "", err
-		}
-	} else {
-		digest, err := d.fetch(ctx, name, bundle)
-		if err != nil {
-			return "", err
-		}
-		if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
-			return "", err
-		}
-		if !d.cfg.AllowUnsignedBundle {
-			if err := d.verifyBundle(ctx, name, bundle); err != nil {
-				return "", err
-			}
-		}
+	}
+	digest, err := download(ctx, tag, bundle)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyArtifactDigest(artifactDigest, digest); err != nil {
+		return "", err
 	}
 	if err := d.run.ID.own(bundle); err != nil {
 		return "", err
@@ -491,23 +428,6 @@ func (d *StackDeployer) prepareRelease(ctx context.Context, tag, name, artifactD
 		}
 	}
 	return releaseDir, nil
-}
-
-// verifyBundle downloads <name>.sig (a cosign bundle from sign-blob) and verifies the bundle with the
-// configured key.
-func (d *StackDeployer) verifyBundle(ctx context.Context, name, bundle string) error {
-	sig := bundle + ".sig"
-	if _, err := d.fetch(ctx, name+".sig", sig); err != nil {
-		return fmt.Errorf("bundle signature: %w", err)
-	}
-	if err := d.run.ID.own(sig); err != nil {
-		return err
-	}
-	args := append(append([]string{"verify-blob", "--key", d.cfg.CosignPublicKey}, d.cfg.CosignArgs...), "--bundle", sig, bundle)
-	if err := d.run.Run(ctx, "", nil, d.cfg.CosignBinary, args...); err != nil {
-		return fmt.Errorf("bundle signature check failed: %w", err)
-	}
-	return nil
 }
 
 // readLock parses the lock file (services.<name>.image) and requires every image pinned by digest.
@@ -571,7 +491,7 @@ func (d *StackDeployer) verifyImages(ctx context.Context, images map[string]stri
 	return nil
 }
 
-// checkConfirm refuses image changes of stack.confirm_services that the payload did not confirm.
+// checkConfirm refuses image changes of stack.confirm_services that the deploy did not confirm.
 func (d *StackDeployer) checkConfirm(previous, releaseDir string, confirmed []string) error {
 	if len(d.cfg.ConfirmServices) == 0 {
 		return nil
@@ -595,7 +515,7 @@ func (d *StackDeployer) checkConfirm(previous, releaseDir string, confirmed []st
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("image change of %s needs confirmation: send \"confirm\": [%q] after a backup", strings.Join(missing, ", "), strings.Join(missing, `", "`))
+		return fmt.Errorf("image change of %s needs confirmation: after a backup, run magenx-deputy-go bootstrap -skip-code -stack-tag <tag> -confirm %s", strings.Join(missing, ", "), strings.Join(missing, ","))
 	}
 	return nil
 }

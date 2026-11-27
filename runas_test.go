@@ -179,12 +179,3 @@ func TestDeployAsOtherUser(t *testing.T) {
 		}
 	}
 }
-
-type recordingDeployer struct {
-	calls []DeployPayload
-}
-
-func (r *recordingDeployer) Deploy(_ context.Context, p DeployPayload) error {
-	r.calls = append(r.calls, p)
-	return nil
-}

@@ -102,7 +102,7 @@ func TestOCIFetchRefusesWrongArchive(t *testing.T) {
 	verified := false
 	verify := func(context.Context, ociArtifact) error { verified = true; return nil }
 	_, err := c.fetch(context.Background(), repo, "v1", digestOf([]byte("other")), filepath.Join(dir, "x"), verify)
-	if err == nil || !strings.Contains(err.Error(), "the webhook expects") || verified {
+	if err == nil || !strings.Contains(err.Error(), ", expected sha256:") || verified {
 		t.Fatalf("wrong digest: err=%v verified=%v", err, verified)
 	}
 	if _, err := c.fetch(context.Background(), repo, "v2", "", filepath.Join(dir, "y"), nil); err == nil || !strings.Contains(err.Error(), "has 2 layers") {
@@ -131,7 +131,7 @@ func TestValidateOCIRepository(t *testing.T) {
 	}
 }
 
-// codeOCIEnv is a code deployer with source oci, a test registry and the fake cosign.
+// codeOCIEnv is a code deployer on a test registry with the fake cosign.
 func codeOCIEnv(t *testing.T) (*testEnv, string, string) {
 	t.Helper()
 	e := newTestEnv(t)
@@ -140,7 +140,6 @@ func codeOCIEnv(t *testing.T) (*testEnv, string, string) {
 	writeFile(t, filepath.Join(fake, "cosign.pub"), "-----BEGIN PUBLIC KEY-----\n", 0o644)
 	repo := newRegistry(t) + "/acme/magento-release"
 	cfg := e.deployer.cfg
-	cfg.Deploy.Source = sourceOCI
 	cfg.Deploy.OCIRepository = repo
 	cfg.Deploy.CosignBinary = filepath.Join(fake, "cosign")
 	cfg.Deploy.CosignPublicKey = filepath.Join(fake, "cosign.pub")
@@ -151,7 +150,7 @@ func codeOCIEnv(t *testing.T) (*testEnv, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.deployer = &S3MagentoDeployer{cfg: cfg, run: newRunner(id, nil), sigRun: newRunner(id, []string{"FAKE_DIR=" + fake}), oci: ociClient{}}
+	e.deployer = &CodeDeployer{cfg: cfg, run: newRunner(id, nil), sigRun: newRunner(id, []string{"FAKE_DIR=" + fake}), oci: ociClient{}}
 	if err := e.deployer.checkTools(); err != nil {
 		t.Fatal(err)
 	}
@@ -163,15 +162,7 @@ func TestCodeDeployFromOCI(t *testing.T) {
 	archive := makeTarGz(t, map[string]string{"index.php": "v1"})
 	manifest := pushRelease(t, repo, archive, "v1.0.0", "v1.0.0")
 
-	payload := DeployPayload{Tag: "v1.0.0", ArtifactDigest: digestOf(archive)}
-	s := &Server{cfg: e.deployer.cfg}
-	if msg := s.validateCodePayload(&payload); msg != "" {
-		t.Fatal(msg)
-	}
-	if payload.ArtifactName != "release_v1.0.0.tar.gz" {
-		t.Fatalf("artifact_name=%q", payload.ArtifactName)
-	}
-	if err := e.deployer.Deploy(context.Background(), payload); err != nil {
+	if err := e.deployer.Deploy(context.Background(), Release{Tag: "v1.0.0", ArtifactDigest: digestOf(archive)}); err != nil {
 		t.Fatal(err)
 	}
 	if filepath.Base(e.current()) != "v1.0.0" || readFile(t, filepath.Join(e.releasesDir(), "v1.0.0", "index.php")) != "v1" {
@@ -186,7 +177,7 @@ func TestCodeDeployFromOCI(t *testing.T) {
 	writeFile(t, filepath.Join(fake, "cosign_fail"), "acme/magento-release\n", 0o644)
 	archive2 := makeTarGz(t, map[string]string{"index.php": "v2"})
 	pushRelease(t, repo, archive2, "v2.0.0", "v2.0.0")
-	err := e.deployer.Deploy(context.Background(), DeployPayload{Tag: "v2.0.0", ArtifactName: "release_v2.0.0.tar.gz", ArtifactDigest: digestOf(archive2)})
+	err := e.deployer.Deploy(context.Background(), Release{Tag: "v2.0.0", ArtifactDigest: digestOf(archive2)})
 	if err == nil || !strings.Contains(err.Error(), "signature check") || filepath.Base(e.current()) != "v1.0.0" {
 		t.Fatalf("unsigned release: err=%v current=%q", err, e.current())
 	}
@@ -195,38 +186,30 @@ func TestCodeDeployFromOCI(t *testing.T) {
 	}
 }
 
-func TestCodePayloadTagNeedsOCI(t *testing.T) {
-	e := newTestEnv(t)
-	s := &Server{cfg: e.deployer.cfg}
-	p := DeployPayload{ArtifactName: "release_1.tar.gz", ArtifactDigest: digestOf([]byte("x")), Tag: "v1"}
-	if msg := s.validateCodePayload(&p); !strings.Contains(msg, "deploy.source oci") {
-		t.Fatalf("tag with source s3: %q", msg)
-	}
-	s.cfg.Deploy.Source = sourceOCI
-	p = DeployPayload{ArtifactDigest: digestOf([]byte("x"))}
-	if msg := s.validateCodePayload(&p); !strings.Contains(msg, "tag is required") {
-		t.Fatalf("no tag with source oci: %q", msg)
-	}
-}
-
 func TestStackDeployFromOCI(t *testing.T) {
 	e := newStackEnv(t)
 	digest := e.addRelease("v1.0.0", nil, nil)
 	repo := newRegistry(t) + "/acme/stack"
 	manifest := pushRelease(t, repo, e.objects[stackBundleName("v1.0.0")], "v1.0.0", "v1.0.0")
-	e.deployer.cfg.Source = sourceOCI
 	e.deployer.cfg.OCIRepository = repo
+	e.deployer.download = nil // the registry, not the fake
 
 	if err := e.deploy("v1.0.0", digest); err != nil {
 		t.Fatal(err)
 	}
 	if e.current() != "v1.0.0" || len(e.downloads) != 0 {
-		t.Fatalf("current=%q s3 downloads=%v", e.current(), e.downloads)
+		t.Fatalf("current=%q fake downloads=%v", e.current(), e.downloads)
 	}
-	log := e.log()
-	if !strings.Contains(log, "cosign verify --key "+e.deployer.cfg.CosignPublicKey+" --insecure-ignore-tlog=true "+repo+"@"+manifest+"\n") ||
-		strings.Contains(log, "verify-blob") {
-		t.Fatalf("want the manifest signature, not verify-blob\n%s", log)
+	if log := e.log(); !strings.Contains(log, "cosign verify --key "+e.deployer.cfg.CosignPublicKey+" --insecure-ignore-tlog=true "+repo+"@"+manifest+"\n") {
+		t.Fatalf("manifest signature not verified\n%s", log)
+	}
+
+	// a bundle signature that does not verify: nothing is deployed
+	e.fail("cosign", "acme/stack@")
+	digest2 := e.addRelease("v2.0.0", nil, nil)
+	pushRelease(t, repo, e.objects[stackBundleName("v2.0.0")], "v2.0.0", "v2.0.0")
+	if err := e.deploy("v2.0.0", digest2); err == nil || !strings.Contains(err.Error(), "signature check") || e.current() != "v1.0.0" {
+		t.Fatalf("unsigned bundle: err=%v current=%q", err, e.current())
 	}
 }
 
@@ -296,11 +279,11 @@ func newBootstrapEnv(t *testing.T) *bootstrapEnv {
 		Deploy: DeployConfig{
 			RootDir: filepath.Join(root, "www"), DefaultBrand: "shop", DefaultDomain: "shop.example",
 			LeaderEnvVar: "DEPUTY_TEST_LEADER_UNSET", LeaderDefault: true,
-			Source: sourceOCI, OCIRepository: e.codeRepo,
-			CosignBinary: filepath.Join(fake, "cosign"), CosignPublicKey: filepath.Join(fake, "cosign.pub"),
+			OCIRepository: e.codeRepo,
+			CosignBinary:  filepath.Join(fake, "cosign"), CosignPublicKey: filepath.Join(fake, "cosign.pub"),
 		},
 		Stack: StackConfig{
-			Enabled: true, Dir: filepath.Join(root, "stack"), Source: sourceOCI, OCIRepository: e.stackRepo,
+			Enabled: true, Dir: filepath.Join(root, "stack"), OCIRepository: e.stackRepo,
 			DockerBinary: filepath.Join(fake, "docker"), CosignBinary: filepath.Join(fake, "cosign"),
 			CosignPublicKey: filepath.Join(fake, "cosign.pub"), ExcludeServices: []string{"magento"},
 			SharedLinks: []SharedTarget{{Source: filepath.Join(shared, ".env.secrets"), Target: ".env.secrets"}},
@@ -323,7 +306,7 @@ func (e *bootstrapEnv) build() {
 		e.t.Fatal(err)
 	}
 	run := newRunner(id, []string{"FAKE_DIR=" + e.fake})
-	code := &S3MagentoDeployer{cfg: e.cfg, run: run, sigRun: run, oci: ociClient{cfg: e.cfg.OCI}}
+	code := &CodeDeployer{cfg: e.cfg, run: run, sigRun: run, oci: ociClient{cfg: e.cfg.OCI}}
 	e.server = &Server{cfg: e.cfg, deployer: code, stack: newStackDeployer(e.cfg, run)}
 }
 
@@ -453,17 +436,6 @@ func TestBootstrapRefusals(t *testing.T) {
 		"no version annotation": {func(e *bootstrapEnv) {
 			pushRelease(e.t, e.stackRepo, []byte("x"), "", "production")
 		}, "annotation"},
-		"unsigned bundle allowed": {func(e *bootstrapEnv) {
-			e.pushBoth("v1", "production")
-			e.cfg.Stack.AllowUnsignedBundle = true
-		}, "allow_unsigned_bundle"},
-		"stack from s3": {func(e *bootstrapEnv) {
-			e.cfg.Stack.Source = sourceS3
-		}, "stack.source oci"},
-		"code without key": {func(e *bootstrapEnv) {
-			e.pushBoth("v1", "production")
-			e.cfg.Deploy.CosignPublicKey = ""
-		}, "deploy.cosign_public_key"},
 		"code signature fails": {func(e *bootstrapEnv) {
 			e.pushBoth("v1", "production")
 			writeFile(e.t, filepath.Join(e.fake, "cosign_fail"), "acme/magento-release\n", 0o644)
@@ -471,7 +443,7 @@ func TestBootstrapRefusals(t *testing.T) {
 		"version tag holds another archive": {func(e *bootstrapEnv) {
 			e.pushBoth("v1", "production")
 			pushRelease(e.t, e.codeRepo, makeTarGz(e.t, map[string]string{"x": "other"}), "v1", "v1")
-		}, "the webhook expects"},
+		}, ", expected sha256:"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newBootstrapEnv(t)

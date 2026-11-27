@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -12,12 +11,11 @@ import (
 	"time"
 )
 
-// bootstrap deploys the release a moving tag (e.g. production) points to, on a new server and without a
-// webhook: first the docker stack, then the Magento code. Both must come from source oci. The tag is resolved
-// to its manifest, the manifest annotation org.opencontainers.image.version names the release, and the same
-// Deploy as for a webhook runs with <repository>:<version> and the layer digest of the moving tag, so the
-// version tag must hold the same archive. Nothing here is signed by the webhook HMAC, so bootstrap requires
-// cosign checks: stack.allow_unsigned_bundle false and deploy.cosign_public_key set.
+// bootstrap deploys the release a moving tag (e.g. production) points to once, before the service runs (a new
+// server from cloud-init): first the docker stack, then the Magento code. The tag is resolved to its manifest,
+// the manifest annotation org.opencontainers.image.version names the release, and the same Deploy as the watch
+// runs with <repository>:<version> and the layer digest of the moving tag, so the version tag must hold the
+// same archive. The cosign signatures are checked as for every deploy.
 
 type bootstrapOptions struct {
 	StackTag  string
@@ -40,7 +38,7 @@ func runBootstrap(args []string) int {
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: magenx-deputy-go bootstrap [flags]\n\n"+
 			"Deploys the stack and the Magento release that a moving image tag points to, before the\n"+
-			"webhook service runs (new server, cloud-init). Needs source oci and cosign signature checks.\n\n")
+			"service runs (new server, cloud-init).\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -79,7 +77,7 @@ func runBootstrap(args []string) int {
 }
 
 func bootstrap(ctx context.Context, cfg Config, s *Server, opts bootstrapOptions) error {
-	// a running service (webhook, watch) and bootstrap take turns
+	// a running service (watch) and bootstrap take turns
 	unlock, err := s.lockDeploys()
 	if err != nil {
 		return err
@@ -118,60 +116,27 @@ func resolveRelease(ctx context.Context, oci ociClient, repository, tag string) 
 	return a, nil
 }
 
-// stackFromRegistry fails unless the stack can be deployed from a moving tag: source oci and the bundle
-// signature checked, the trust anchor when no webhook HMAC covers the digest (bootstrap, watch).
-func stackFromRegistry(cfg StackConfig) error {
-	if cfg.Source != sourceOCI {
-		return errors.New("needs stack.source oci: S3 has no moving tag")
-	}
-	if cfg.AllowUnsignedBundle {
-		return errors.New("needs the bundle signature check: set stack.allow_unsigned_bundle false")
-	}
-	return nil
-}
-
-// codeFromRegistry is stackFromRegistry for the Magento code: source oci and deploy.cosign_public_key.
-func codeFromRegistry(cfg DeployConfig) error {
-	if cfg.Source != sourceOCI {
-		return errors.New("needs deploy.source oci: S3 has no moving tag")
-	}
-	if cfg.CosignPublicKey == "" {
-		return errors.New("needs the release signature check: set deploy.cosign_public_key")
-	}
-	return nil
-}
-
-// deployStackRelease deploys the resolved stack release a like a webhook with its version and layer digest.
-// The caller holds s.mu.
+// deployStackRelease deploys the resolved stack release a with its version and layer digest.
+// The caller holds the deploy lock.
 func deployStackRelease(ctx context.Context, cfg Config, s *Server, a ociArtifact, confirm []string) error {
-	payload := DeployPayload{Kind: "stack", Tag: a.Version, ArtifactDigest: a.LayerDigest, Confirm: confirm}
-	if msg := s.validateStackPayload(&payload); msg != "" {
-		return errors.New(msg)
-	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Stack.DeploymentTimeoutSeconds)*time.Second)
 	defer cancel()
-	return s.stack.Deploy(ctx, payload)
+	return s.stack.Deploy(ctx, Release{Tag: a.Version, ArtifactDigest: a.LayerDigest, Confirm: confirm})
 }
 
-// deployCodeRelease deploys the resolved Magento release a, unless it is current already. The caller holds s.mu.
+// deployCodeRelease deploys the resolved Magento release a, unless it is current already. The caller holds
+// the deploy lock.
 func deployCodeRelease(ctx context.Context, cfg Config, s *Server, a ociArtifact) error {
 	if current := currentCodeRelease(cfg); current == a.Version {
 		log.Printf("code %s already current", a.Version)
 		return nil
 	}
-	payload := DeployPayload{Kind: "code", Tag: a.Version, ArtifactDigest: a.LayerDigest}
-	if msg := s.validateCodePayload(&payload); msg != "" {
-		return errors.New(msg)
-	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DeploymentTimeoutSeconds)*time.Second)
 	defer cancel()
-	return s.deployer.Deploy(ctx, payload)
+	return s.deployer.Deploy(ctx, Release{Tag: a.Version, ArtifactDigest: a.LayerDigest})
 }
 
 func bootstrapStack(ctx context.Context, cfg Config, s *Server, opts bootstrapOptions) error {
-	if err := stackFromRegistry(cfg.Stack); err != nil {
-		return fmt.Errorf("bootstrap %w (or use -skip-stack)", err)
-	}
 	a, err := resolveRelease(ctx, ociClient{cfg: cfg.OCI}, cfg.Stack.OCIRepository, opts.StackTag)
 	if err != nil {
 		return err
@@ -180,9 +145,6 @@ func bootstrapStack(ctx context.Context, cfg Config, s *Server, opts bootstrapOp
 }
 
 func bootstrapCode(ctx context.Context, cfg Config, s *Server, opts bootstrapOptions) error {
-	if err := codeFromRegistry(cfg.Deploy); err != nil {
-		return fmt.Errorf("bootstrap %w (or use -skip-code)", err)
-	}
 	a, err := resolveRelease(ctx, ociClient{cfg: cfg.OCI}, cfg.Deploy.OCIRepository, opts.CodeTag)
 	if err != nil {
 		return err
