@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.0.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.2...v3.0.0) (2026-11-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* the webhook and the S3 source are removed. Remove webhook_path, webhook_secret, hmac_key, timestamp_window_seconds, allow_missing_artifact_digest, deploy.source, deploy.s3_*, stack.source, stack.s3_prefix, stack.allow_unsigned_bundle and watch.enabled from the config (unknown keys stop deputy at start); deploy.oci_repository and deploy.cosign_public_key are required.
+
+### 🚀 Features
+
+* Remove the webhook and the S3 source, deploy only from the registry ([#70](https://github.com/magenxcommerce/magenx-deputy-go/issues/70)) ([7edf8f7](https://github.com/magenxcommerce/magenx-deputy-go/commit/7edf8f7b75e16383da8bc187294391ba2d447d25))
+
+
+### 🚦 Maintenance
+
+* **main:** magenx-deputy-go 3.0.0-rc ([#71](https://github.com/magenxcommerce/magenx-deputy-go/issues/71)) ([45a11eb](https://github.com/magenxcommerce/magenx-deputy-go/commit/45a11eb69972bec81522bc850fb95f49ab033f8e))
+
 ## [3.0.0-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.2...v3.0.0-rc) (2026-11-27)
 
 
