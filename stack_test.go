@@ -228,7 +228,7 @@ func TestStackDeploySuccess(t *testing.T) {
 	if got := readFile(t, filepath.Join(release, ".env.secrets")); got != "SECRET=1\n" {
 		t.Fatalf(".env.secrets via shared link=%q", got)
 	}
-	if got := strings.TrimSpace(readFile(t, filepath.Join(release, stackTagFile))); got != "v1.0.0" {
+	if got := strings.TrimSpace(readFile(t, filepath.Join(release, releaseFile))); got != "v1.0.0" {
 		t.Fatalf("tag file=%q", got)
 	}
 	entries, _ := os.ReadDir(filepath.Join(e.dir, "releases"))

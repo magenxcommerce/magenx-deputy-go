@@ -190,12 +190,19 @@ func bootstrapCode(ctx context.Context, cfg Config, s *Server, opts bootstrapOpt
 	return deployCodeRelease(ctx, cfg, s, a)
 }
 
-// currentCodeRelease is the name of the release dir the code current link points to, "" without one.
+// currentCodeRelease is the version of the release the code current link points to, "" without one: the
+// version recorded in the release dir, or the dir name for a release deployed before it was recorded.
 func currentCodeRelease(cfg Config) string {
 	link := filepath.Join(cfg.Deploy.RootDir, cfg.Deploy.DefaultBrand, filepath.FromSlash(cfg.Deploy.CurrentLinkSuffix))
 	target, err := os.Readlink(link)
 	if err != nil {
 		return ""
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(link), target)
+	}
+	if v := readReleaseFile(target); v != "" {
+		return v
 	}
 	return filepath.Base(target)
 }

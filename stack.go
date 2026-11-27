@@ -93,8 +93,35 @@ var (
 	pinnedPattern  = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 )
 
-// stackTagFile in a release dir records the tag it was deployed from.
-const stackTagFile = ".deputy-release"
+// releaseFile in a stack or code release dir records the version it was deployed from. The dir name is not
+// enough: a redeploy of a version whose dir exists (a rollback by moving the tag back) gets <version>-<UTC
+// timestamp>, see uniqueReleaseDir.
+const releaseFile = ".deputy-release"
+
+// writeReleaseFile records version in releaseDir, owned by id. The release may ship a file or symlink with
+// this name: it is replaced, never written through.
+func writeReleaseFile(id Identity, releaseDir, version string) error {
+	path := filepath.Join(releaseDir, releaseFile)
+	if err := os.RemoveAll(path); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(version+"\n"), 0o640); err != nil {
+		return err
+	}
+	return id.own(path)
+}
+
+// readReleaseFile is the version recorded in releaseDir, "" without a valid one.
+func readReleaseFile(releaseDir string) string {
+	b, err := os.ReadFile(filepath.Join(releaseDir, releaseFile))
+	if err != nil {
+		return ""
+	}
+	if v := strings.TrimSpace(string(b)); isSafeName(v) {
+		return v
+	}
+	return ""
+}
 
 // stackBundleName is the S3 object name of a tag when the webhook does not send artifact_name.
 func stackBundleName(tag string) string { return "stack_" + tag + ".tar.gz" }
@@ -268,8 +295,7 @@ func (d *StackDeployer) currentRelease() (dir, tag string) {
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(d.cfg.Dir, target)
 	}
-	b, _ := os.ReadFile(filepath.Join(target, stackTagFile))
-	return target, strings.TrimSpace(string(b))
+	return target, readReleaseFile(target)
 }
 
 func (d *StackDeployer) fetch(ctx context.Context, name, destination string) (string, error) {
@@ -453,7 +479,7 @@ func (d *StackDeployer) prepareRelease(ctx context.Context, tag, name, artifactD
 		return "", fmt.Errorf("move release into place: %w", err)
 	}
 	releaseDir = target
-	if err := d.writeOwned(filepath.Join(releaseDir, stackTagFile), tag+"\n"); err != nil {
+	if err := writeReleaseFile(d.run.ID, releaseDir, tag); err != nil {
 		return "", err
 	}
 	if err := linkSharedPaths(d.run.ID, releaseDir, d.cfg.SharedLinks); err != nil {
@@ -482,17 +508,6 @@ func (d *StackDeployer) verifyBundle(ctx context.Context, name, bundle string) e
 		return fmt.Errorf("bundle signature check failed: %w", err)
 	}
 	return nil
-}
-
-func (d *StackDeployer) writeOwned(path, content string) error {
-	// the release may ship a file or symlink with this name: replace it, never write through it
-	if err := os.RemoveAll(path); err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
-		return err
-	}
-	return d.run.ID.own(path)
 }
 
 // readLock parses the lock file (services.<name>.image) and requires every image pinned by digest.

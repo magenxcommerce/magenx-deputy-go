@@ -731,6 +731,9 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactF
 		return "", fmt.Errorf("move release into place: %w", err)
 	}
 	releaseDir = target
+	if err := writeReleaseFile(d.run.ID, releaseDir, releaseVersion); err != nil {
+		return "", err
+	}
 
 	if err := linkSharedPaths(d.run.ID, releaseDir, d.cfg.SharedLinks); err != nil {
 		return "", err
