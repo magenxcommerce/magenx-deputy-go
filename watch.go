@@ -18,7 +18,7 @@ import (
 	"github.com/magenxcommerce/magenx-deputy-go/version"
 )
 
-// Watch deploys what the moving tags (production, staging) point to, without a webhook: every interval deputy
+// Watch deploys what the moving tags (production, staging) point to: every interval deputy
 // asks the registry for the digest of each tag (one HEAD request), and only when it changed it resolves the
 // release and runs the same deploy as bootstrap: the stack first, then the Magento code. A digest whose deploy
 // failed is not tried again until the tag moves (or deputy restarts). POST <check_path> asks for a check now,
@@ -26,7 +26,6 @@ import (
 
 // WatchConfig is the watch section of the config.
 type WatchConfig struct {
-	Enabled bool `json:"enabled" yaml:"enabled"`
 	// IntervalSeconds between checks, plus up to 10% random jitter. Default 300, at least 30.
 	IntervalSeconds int64 `json:"interval_seconds" yaml:"interval_seconds"`
 	// StackTag and CodeTag are the moving tags in stack.oci_repository and deploy.oci_repository. Default production.
@@ -66,11 +65,8 @@ func (c *WatchConfig) applyDefaults() {
 	}
 }
 
-// validate checks the watch section; cfg is the whole config (sources, keys, webhook path).
-func (c WatchConfig) validate(cfg Config) error {
-	if !c.Enabled {
-		return nil
-	}
+// validate checks the watch section.
+func (c WatchConfig) validate() error {
 	if time.Duration(c.IntervalSeconds)*time.Second < minWatchInterval {
 		return fmt.Errorf("watch.interval_seconds must be at least %d", int(minWatchInterval.Seconds()))
 	}
@@ -82,20 +78,12 @@ func (c WatchConfig) validate(cfg Config) error {
 			return fmt.Errorf("%s: invalid tag %q", field, tag)
 		}
 	}
-	if err := codeFromRegistry(cfg.Deploy); err != nil {
-		return fmt.Errorf("watch %w", err)
-	}
-	if cfg.Stack.Enabled {
-		if err := stackFromRegistry(cfg.Stack); err != nil {
-			return fmt.Errorf("watch %w", err)
-		}
-	}
 	for field, path := range map[string]string{"watch.check_path": c.CheckPath, "watch.status_path": c.StatusPath} {
 		if path == "-" {
 			continue
 		}
-		if !strings.HasPrefix(path, "/") || path == cfg.WebhookPath {
-			return fmt.Errorf("%s must start with / and differ from webhook_path", field)
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("%s must start with / (or be - to disable it)", field)
 		}
 	}
 	if c.CheckPath == c.StatusPath && c.CheckPath != "-" {

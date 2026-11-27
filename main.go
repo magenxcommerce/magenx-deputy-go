@@ -2,11 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,36 +17,29 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
-	sdkconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"gopkg.in/yaml.v3"
 
 	"github.com/magenxcommerce/magenx-deputy-go/version"
 )
 
+// Config: deputy deploys the releases that moving tags in an OCI registry point to (watch, bootstrap). There
+// is no inbound deploy request: the cosign signatures are the trust anchor.
 type Config struct {
-	ListenAddr               string `json:"listen_addr" yaml:"listen_addr"`
-	WebhookPath              string `json:"webhook_path" yaml:"webhook_path"`
-	WebhookSecret            string `json:"webhook_secret" yaml:"webhook_secret"`
-	HMACKey                  string `json:"hmac_key" yaml:"hmac_key"`
-	TimestampWindowSeconds   int64  `json:"timestamp_window_seconds" yaml:"timestamp_window_seconds"`
-	DeploymentTimeoutSeconds int64  `json:"deployment_timeout_seconds" yaml:"deployment_timeout_seconds"`
-	// AllowMissingArtifactDigest accepts payloads without artifact_digest. Digests that are sent are always verified.
-	AllowMissingArtifactDigest bool           `json:"allow_missing_artifact_digest" yaml:"allow_missing_artifact_digest"`
-	Deploy                     DeployConfig   `json:"deploy" yaml:"deploy"`
-	HealthCheck                HealthCheck    `json:"health_check" yaml:"health_check"`
-	SharedLinks                []SharedTarget `json:"shared_links" yaml:"shared_links"`
-	Stack                      StackConfig    `json:"stack" yaml:"stack"`
-	// OCI is the registry login for archives deployed with source oci (code and stack).
+	// ListenAddr serves POST watch.check_path and GET watch.status_path.
+	ListenAddr               string         `json:"listen_addr" yaml:"listen_addr"`
+	DeploymentTimeoutSeconds int64          `json:"deployment_timeout_seconds" yaml:"deployment_timeout_seconds"`
+	Deploy                   DeployConfig   `json:"deploy" yaml:"deploy"`
+	HealthCheck              HealthCheck    `json:"health_check" yaml:"health_check"`
+	SharedLinks              []SharedTarget `json:"shared_links" yaml:"shared_links"`
+	Stack                    StackConfig    `json:"stack" yaml:"stack"`
+	// OCI is the registry login for the archives (code and stack).
 	OCI OCIConfig `json:"oci" yaml:"oci"`
-	// Watch deploys what moving tags point to, without a webhook.
+	// Watch deploys what the moving tags point to.
 	Watch WatchConfig `json:"watch" yaml:"watch"`
 }
 
@@ -60,24 +50,15 @@ type DeployConfig struct {
 	DefaultBrand       string `json:"default_brand" yaml:"default_brand"`
 	DefaultDomain      string `json:"default_domain" yaml:"default_domain"`
 	MinimumDiskSpaceGB uint64 `json:"minimum_disk_space_gb" yaml:"minimum_disk_space_gb"`
-	// Source of the release archives: s3 (default) or oci. With oci the webhook sends tag (the image tag of
-	// the release in OCIRepository) and artifact_digest (the archive, which is the image's only layer).
-	Source        string `json:"source" yaml:"source"`
+	// OCIRepository holds one image per release (tag = version) whose only layer is the archive.
 	OCIRepository string `json:"oci_repository" yaml:"oci_repository"`
-	// CosignPublicKey, when set, verifies the signature of the release manifest (source oci) before the
-	// archive is downloaded. Required by bootstrap, which has no webhook digest to rely on.
-	CosignPublicKey  string   `json:"cosign_public_key" yaml:"cosign_public_key"`
-	CosignBinary     string   `json:"cosign_binary" yaml:"cosign_binary"`
-	CosignArgs       []string `json:"cosign_args" yaml:"cosign_args"`
-	S3Bucket         string   `json:"s3_bucket" yaml:"s3_bucket"`
-	S3BucketPerBrand bool     `json:"s3_bucket_per_brand" yaml:"s3_bucket_per_brand"`
-	S3Prefix         string   `json:"s3_prefix" yaml:"s3_prefix"`
-	S3Endpoint       string   `json:"s3_endpoint" yaml:"s3_endpoint"`
-	S3Region         string   `json:"s3_region" yaml:"s3_region"`
-	S3UsePathStyle   bool     `json:"s3_use_path_style" yaml:"s3_use_path_style"`
-	LeaderEnvVar     string   `json:"leader_env_var" yaml:"leader_env_var"`
-	LeaderDefault    bool     `json:"leader_default" yaml:"leader_default"`
-	LeaderCommands   []string `json:"leader_commands" yaml:"leader_commands"`
+	// CosignPublicKey verifies the signature of the release manifest before the archive is downloaded.
+	CosignPublicKey string   `json:"cosign_public_key" yaml:"cosign_public_key"`
+	CosignBinary    string   `json:"cosign_binary" yaml:"cosign_binary"`
+	CosignArgs      []string `json:"cosign_args" yaml:"cosign_args"`
+	LeaderEnvVar    string   `json:"leader_env_var" yaml:"leader_env_var"`
+	LeaderDefault   bool     `json:"leader_default" yaml:"leader_default"`
+	LeaderCommands  []string `json:"leader_commands" yaml:"leader_commands"`
 	// PreSwitchCommands run on the leader inside the new release before the current symlink switches.
 	PreSwitchCommands []string `json:"pre_switch_commands" yaml:"pre_switch_commands"`
 	// RollbackCommands run on the leader after the current symlink was switched back to the previous release.
@@ -115,23 +96,18 @@ type SharedTarget struct {
 	Target string `json:"target" yaml:"target"`
 }
 
-type DeployPayload struct {
-	// Kind selects the deployer: "" or "code" for a Magento release, "stack" for a docker stack release.
-	Kind           string `json:"kind" yaml:"kind"`
-	ArtifactName   string `json:"artifact_name" yaml:"artifact_name"`
-	ArtifactDigest string `json:"artifact_digest" yaml:"artifact_digest"`
-	Brand          string `json:"brand" yaml:"brand"`
-	Domain         string `json:"domain" yaml:"domain"`
-	Timestamp      int64  `json:"timestamp" yaml:"timestamp"`
-	// Tag is the release of the docker stack (kind stack): name of the release dir, bundle stack_<tag>.tar.gz.
-	// With source oci it is also the image tag of the release, for code deploys too (release_<tag>.tar.gz).
-	Tag string `json:"tag" yaml:"tag"`
-	// Confirm lists services listed in stack.confirm_services whose image may change with this release.
-	Confirm []string `json:"confirm" yaml:"confirm"`
+// Release is one release to deploy, resolved from a moving tag (watch, bootstrap).
+type Release struct {
+	// Tag is the image tag of the release (its version) and the name of its release dir.
+	Tag string
+	// ArtifactDigest is the archive, the only layer of the image: sha256:<hex>.
+	ArtifactDigest string
+	// Confirm, stack deploys only: services of stack.confirm_services whose image may change.
+	Confirm []string
 }
 
 type Deployer interface {
-	Deploy(context.Context, DeployPayload) error
+	Deploy(context.Context, Release) error
 }
 
 type Server struct {
@@ -141,23 +117,22 @@ type Server struct {
 	stack Deployer
 	// mu serializes all deploys, code and stack; lockDeploys takes it.
 	mu sync.Mutex
-	// watch is nil without watch.enabled.
+	// watch is nil in bootstrap, which runs no watch.
 	watch *watcher
 	// lockPath is the file lockDeploys flocks across processes: the config file; empty takes only mu.
 	lockPath string
 }
 
 var (
-	brandPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	artifactPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+\.(?:tar\.gz|tgz)$`)
-	digestPattern   = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
-	// namePattern is one path element: release versions, stack tags and artifact names. Deployers check
-	// it, plus "no ..", where they build paths, so they are safe without the webhook handler's checks.
+	brandPattern  = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	digestPattern = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
+	// namePattern is one path element: release versions and tags. Deployers check it, plus "no ..",
+	// where they build paths.
 	namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 )
 
-// logSafe removes CR and LF, so a value from the webhook can never start a new log line. Payload values
-// pass through it where a deployer takes them over: they are logged, and errors that contain them are.
+// logSafe removes CR and LF, so a value from the registry (the version annotation) or the command line can
+// never start a new log line. Release values pass through it where a deployer takes them over.
 func logSafe(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	return strings.ReplaceAll(s, "\r", "")
@@ -184,10 +159,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
-	// bootstrap needs neither, the service at least one
-	if !cfg.webhookEnabled() && !cfg.Watch.Enabled {
-		log.Fatal("nothing to do: set webhook_secret and hmac_key for the webhook, or watch.enabled")
-	}
 	server, err := buildServer(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -196,15 +167,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if cfg.Watch.Enabled {
-		server.watch = newWatcher(cfg, server)
-		if !cfg.listens() {
-			// no inbound port at all: the registry is only polled
-			server.watch.run(ctx)
-			return
-		}
-		go server.watch.run(ctx)
+	server.watch = newWatcher(cfg, server)
+	if !cfg.listens() {
+		// no inbound port at all: the registry is only polled
+		server.watch.run(ctx)
+		return
 	}
+	go server.watch.run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -215,12 +184,7 @@ func main() {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	if cfg.webhookEnabled() {
-		log.Printf("webhook on %s%s", cfg.ListenAddr, cfg.WebhookPath)
-	}
-	if cfg.Watch.Enabled {
-		log.Printf("watch endpoints on %s: check %q, status %q", cfg.ListenAddr, endpoint(cfg.Watch.CheckPath), endpoint(cfg.Watch.StatusPath))
-	}
+	log.Printf("watch endpoints on %s: check %q, status %q", cfg.ListenAddr, endpoint(cfg.Watch.CheckPath), endpoint(cfg.Watch.StatusPath))
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server failed: %v", err)
 	}
@@ -247,7 +211,7 @@ func buildServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	oci := ociClient{cfg: cfg.OCI}
-	code := &S3MagentoDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv), sigRun: newRunner(ownID, nil), oci: oci}
+	code := &CodeDeployer{cfg: cfg, run: newRunner(codeID, cfg.Deploy.CommandEnv), sigRun: newRunner(ownID, nil), oci: oci}
 	if cfg.Deploy.CommandsRunAs != "" {
 		cmd := newRunner(cmdID, cfg.Deploy.CommandEnv)
 		code.cmd = &cmd
@@ -256,7 +220,7 @@ func buildServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("deploy: %w", err)
 	}
 	server := &Server{cfg: cfg, deployer: code}
-	log.Printf("code deploys from %s owned by %s, commands run as %s", cfg.Deploy.Source, codeID, cmdID)
+	log.Printf("code deploys from %s owned by %s, commands run as %s", cfg.Deploy.OCIRepository, codeID, cmdID)
 
 	if cfg.Stack.Enabled {
 		stackID, err := resolveIdentity(cfg.Stack.RunAs)
@@ -269,7 +233,7 @@ func buildServer(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("stack: %w", err)
 		}
 		server.stack = stack
-		log.Printf("stack deploys from %s into %s run as %s", cfg.Stack.Source, cfg.Stack.Dir, stackID)
+		log.Printf("stack deploys from %s into %s run as %s", cfg.Stack.OCIRepository, cfg.Stack.Dir, stackID)
 	}
 	return server, nil
 }
@@ -298,12 +262,6 @@ func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "0.0.0.0:8082"
 	}
-	if c.WebhookPath == "" {
-		c.WebhookPath = "/deploy"
-	}
-	if c.TimestampWindowSeconds <= 0 {
-		c.TimestampWindowSeconds = 300
-	}
 	if c.DeploymentTimeoutSeconds <= 0 {
 		c.DeploymentTimeoutSeconds = 900
 	}
@@ -319,12 +277,6 @@ func (c *Config) applyDefaults() {
 	if c.Deploy.MinimumDiskSpaceGB == 0 {
 		c.Deploy.MinimumDiskSpaceGB = 10
 	}
-	if c.Deploy.S3Prefix == "" {
-		c.Deploy.S3Prefix = "releases"
-	}
-	if c.Deploy.Source == "" {
-		c.Deploy.Source = sourceS3
-	}
 	if c.Deploy.CosignBinary == "" {
 		c.Deploy.CosignBinary = "cosign"
 	}
@@ -334,12 +286,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.OCI.LoginEnv == "" {
 		c.OCI.LoginEnv = "REGISTRY_PASSWORD"
-	}
-	if c.Deploy.S3Region == "" {
-		c.Deploy.S3Region = "us-east-1"
-	}
-	if !c.Deploy.S3UsePathStyle {
-		c.Deploy.S3UsePathStyle = true
 	}
 	if c.Deploy.LeaderEnvVar == "" {
 		c.Deploy.LeaderEnvVar = "IS_LEADER"
@@ -381,193 +327,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.watch.serveCheck(w, r)
 	case s.watch != nil && path == endpoint(s.cfg.Watch.StatusPath):
 		s.watch.serveStatus(w, r)
-	case s.cfg.webhookEnabled() && path == s.cfg.WebhookPath:
-		s.serveWebhook(w, r)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (s *Server) serveWebhook(w http.ResponseWriter, r *http.Request) {
-	now := time.Now().Unix()
-	if r.URL.Path != s.cfg.WebhookPath {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
-	if err != nil {
-		http.Error(w, "invalid body", http.StatusBadRequest)
-		return
-	}
-
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Webhook-Secret")), []byte(s.cfg.WebhookSecret)) != 1 {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	signature := r.Header.Get("X-Signature")
-	if !validateSignature(s.cfg.HMACKey, body, signature) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	timestamp, err := strconv.ParseInt(r.Header.Get("X-Timestamp"), 10, 64)
-	if err != nil {
-		http.Error(w, "invalid timestamp", http.StatusBadRequest)
-		return
-	}
-	if exceedsTimestampWindow(now, timestamp, s.cfg.TimestampWindowSeconds) {
-		http.Error(w, "expired timestamp", http.StatusForbidden)
-		return
-	}
-
-	var payload DeployPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	if payload.Timestamp != 0 && payload.Timestamp != timestamp {
-		http.Error(w, "timestamp mismatch", http.StatusBadRequest)
-		return
-	}
-
-	deployer := s.deployer
-	timeout := time.Duration(s.cfg.DeploymentTimeoutSeconds) * time.Second
-	switch payload.Kind {
-	case "", "code":
-		if msg := s.validateCodePayload(&payload); msg != "" {
-			http.Error(w, msg, http.StatusBadRequest)
-			return
-		}
-	case "stack":
-		if s.stack == nil {
-			http.Error(w, "stack deploys are not enabled", http.StatusBadRequest)
-			return
-		}
-		if msg := s.validateStackPayload(&payload); msg != "" {
-			http.Error(w, msg, http.StatusBadRequest)
-			return
-		}
-		deployer = s.stack
-		timeout = time.Duration(s.cfg.Stack.DeploymentTimeoutSeconds) * time.Second
-	default:
-		http.Error(w, "unknown kind, expected code or stack", http.StatusBadRequest)
-		return
-	}
-
-	unlock, err := s.lockDeploys()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer unlock()
-
-	// Detached from the request: a dropped client connection must not kill bin/magento mid-run.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
-	defer cancel()
-
-	if err := deployer.Deploy(ctx, payload); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
-// validateCodePayload fills brand and domain from the defaults and returns an error message, or "".
-func (s *Server) validateCodePayload(payload *DeployPayload) string {
-	if len(payload.Confirm) > 0 {
-		return "confirm is only valid with kind stack"
-	}
-	if s.cfg.Deploy.Source == sourceOCI {
-		if !isSafeName(payload.Tag) {
-			return "tag is required with deploy.source oci and must match [A-Za-z0-9][A-Za-z0-9._+-]* without \"..\""
-		}
-		if payload.ArtifactName == "" {
-			payload.ArtifactName = codeArtifactName(payload.Tag)
-		}
-	} else if payload.Tag != "" {
-		return "tag is only valid with kind stack, or deploy.source oci"
-	}
-	brand, err := requireMatchOrEmpty(payload.Brand, s.cfg.Deploy.DefaultBrand)
-	if err != nil {
-		return "brand does not match configured default"
-	}
-	domain, err := requireMatchOrEmpty(payload.Domain, s.cfg.Deploy.DefaultDomain)
-	if err != nil {
-		return "domain does not match configured default"
-	}
-	payload.Brand = brand
-	payload.Domain = domain
-	if payload.ArtifactName == "" || payload.Brand == "" {
-		return "artifact_name and brand are required"
-	}
-	if s.cfg.HealthCheck.Enabled && payload.Domain == "" {
-		return "domain is required when health_check is enabled"
-	}
-	if !isValidPayloadPathFields(payload.Brand, payload.ArtifactName) || !isSafeName(normalizeReleaseVersion(payload.ArtifactName)) {
-		return "invalid brand or artifact_name format"
-	}
-	if payload.ArtifactDigest == "" && !s.cfg.AllowMissingArtifactDigest {
-		return "artifact_digest is required"
-	}
-	if payload.ArtifactDigest != "" && !digestPattern.MatchString(payload.ArtifactDigest) {
-		return "invalid artifact_digest format, expected sha256:<hex>"
-	}
-	return ""
-}
-
-func validateSignature(key string, payload []byte, signature string) bool {
-	algo, hashVal, ok := strings.Cut(signature, "=")
-	if !ok || algo != "sha256" || hashVal == "" {
-		return false
-	}
-	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write(payload)
-	expected := mac.Sum(nil)
-
-	received, err := hex.DecodeString(hashVal)
-	if err != nil {
-		return false
-	}
-	return hmac.Equal(expected, received)
-}
-
-type S3MagentoDeployer struct {
+type CodeDeployer struct {
 	cfg Config
 	// run starts commands and tar as deploy.run_as; files deputy creates are handed to that user.
 	run Runner
 	// cmd runs the commands instead of run when deploy.commands_run_as is set.
 	cmd *Runner
-	// download fetches the artifact to destination and returns its digest; nil uses deploy.source.
-	download func(ctx context.Context, brand, artifact, destination string) (string, error)
-	// oci pulls archives with source oci; sigRun runs cosign as deputy's own user.
+	// download replaces the registry download in tests: writes the archive of tag to destination and returns
+	// its digest, without the signature check.
+	download func(ctx context.Context, tag, destination string) (string, error)
+	// oci pulls the archives; sigRun runs cosign as deputy's own user.
 	oci    ociClient
 	sigRun Runner
 }
 
 // commands is the runner of pre_switch_commands, leader_commands and rollback_commands.
-func (d *S3MagentoDeployer) commands() Runner {
+func (d *CodeDeployer) commands() Runner {
 	if d.cmd != nil {
 		return *d.cmd
 	}
 	return d.run
 }
 
-// codeArtifactName is the archive name of a code release tag with source oci; the release dir is the tag.
+// codeArtifactName is the file name of a downloaded code release; the release dir is the tag.
 func codeArtifactName(tag string) string { return "release_" + tag + ".tar.gz" }
 
 // checkTools fails early when cosign or the public key for code signatures are missing.
-func (d *S3MagentoDeployer) checkTools() error {
-	if d.cfg.Deploy.CosignPublicKey == "" {
-		return nil
-	}
+func (d *CodeDeployer) checkTools() error {
 	if _, err := exec.LookPath(d.cfg.Deploy.CosignBinary); err != nil {
 		return fmt.Errorf("%s not found: %w", d.cfg.Deploy.CosignBinary, err)
 	}
@@ -577,29 +368,26 @@ func (d *S3MagentoDeployer) checkTools() error {
 	return nil
 }
 
-// verifySignature checks the cosign signature of a release manifest when deploy.cosign_public_key is set.
-func (d *S3MagentoDeployer) verifySignature(ctx context.Context, a ociArtifact) error {
-	if d.cfg.Deploy.CosignPublicKey == "" {
-		return nil
-	}
+// verifySignature checks the cosign signature of a release manifest with deploy.cosign_public_key.
+func (d *CodeDeployer) verifySignature(ctx context.Context, a ociArtifact) error {
 	return d.oci.cosignVerifyManifest(ctx, d.sigRun, d.cfg.Deploy.CosignBinary, d.cfg.Deploy.CosignPublicKey, d.cfg.Deploy.CosignArgs, a)
 }
 
-func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (err error) {
-	// Paths come from the config and from names checked here; payload fields are not used in paths.
+func (d *CodeDeployer) Deploy(ctx context.Context, rel Release) (err error) {
+	// Paths come from the config and from the tag checked here.
 	brand := d.cfg.Deploy.DefaultBrand
-	if payload.Brand != "" && payload.Brand != brand {
-		return fmt.Errorf("brand %q does not match deploy.default_brand", logSafe(payload.Brand))
+	releaseVersion := logSafe(rel.Tag)
+	if !isSafeName(releaseVersion) {
+		return fmt.Errorf("invalid tag %q", releaseVersion)
 	}
-	artifactFile := logSafe(payload.ArtifactName)
-	artifactDigest := logSafe(payload.ArtifactDigest)
-	if !namePattern.MatchString(artifactFile) || strings.Contains(artifactFile, "..") {
-		return fmt.Errorf("invalid artifact name %q", artifactFile)
+	artifactDigest := logSafe(rel.ArtifactDigest)
+	if !digestPattern.MatchString(artifactDigest) {
+		return fmt.Errorf("invalid artifact digest %q, expected sha256:<hex>", artifactDigest)
 	}
-	releaseVersion := normalizeReleaseVersion(artifactFile)
-	if !namePattern.MatchString(releaseVersion) || strings.Contains(releaseVersion, "..") {
-		return fmt.Errorf("invalid release version %q from artifact %q", releaseVersion, artifactFile)
+	if len(rel.Confirm) > 0 {
+		return errors.New("confirm is only valid for stack deploys")
 	}
+	artifactFile := codeArtifactName(releaseVersion)
 	// absolute: symlink targets must not depend on the service working directory
 	deployDir, err := filepath.Abs(filepath.Join(d.cfg.Deploy.RootDir, brand))
 	if err != nil {
@@ -622,11 +410,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 		return err
 	}
 
-	tag := logSafe(payload.Tag)
-	if d.cfg.Deploy.Source == sourceOCI && !isSafeName(tag) {
-		return fmt.Errorf("invalid tag %q", tag)
-	}
-	releaseDir, err := d.prepareRelease(ctx, brand, artifactFile, artifactDigest, releasesDir, releaseVersion, tag)
+	releaseDir, err := d.prepareRelease(ctx, artifactFile, artifactDigest, releasesDir, releaseVersion)
 	if err != nil {
 		return err
 	}
@@ -683,7 +467,7 @@ func (d *S3MagentoDeployer) Deploy(ctx context.Context, payload DeployPayload) (
 // prepareRelease downloads, verifies and extracts the artifact into a staging directory, then renames it
 // to a release directory that did not exist before. An existing (possibly live) release is never touched.
 // On error nothing is left behind.
-func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactFile, artifactDigest, releasesDir, releaseVersion, tag string) (releaseDir string, err error) {
+func (d *CodeDeployer) prepareRelease(ctx context.Context, artifactFile, artifactDigest, releasesDir, releaseVersion string) (releaseDir string, err error) {
 	stagingDir, err := makeStagingDir(d.run.ID, releasesDir, releaseVersion)
 	if err != nil {
 		return "", err
@@ -700,16 +484,13 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactF
 
 	artifactPath := filepath.Join(stagingDir, artifactFile)
 	download := d.download
-	switch {
-	case download != nil:
-	case d.cfg.Deploy.Source == sourceOCI:
-		download = func(ctx context.Context, _, _, destination string) (string, error) {
+	if download == nil {
+		// the manifest signature is checked before the download, the layer against artifactDigest
+		download = func(ctx context.Context, tag, destination string) (string, error) {
 			return d.oci.fetch(ctx, d.cfg.Deploy.OCIRepository, tag, artifactDigest, destination, d.verifySignature)
 		}
-	default:
-		download = d.downloadArtifact
 	}
-	actualDigest, err := download(ctx, brand, artifactFile, artifactPath)
+	actualDigest, err := download(ctx, releaseVersion, artifactPath)
 	if err != nil {
 		return "", err
 	}
@@ -742,7 +523,7 @@ func (d *S3MagentoDeployer) prepareRelease(ctx context.Context, brand, artifactF
 }
 
 // rollback points the current symlink back to the previous release and runs rollback commands on the leader.
-func (d *S3MagentoDeployer) rollback(previousRelease, currentLink string) error {
+func (d *CodeDeployer) rollback(previousRelease, currentLink string) error {
 	if previousRelease == "" {
 		if err := os.Remove(currentLink); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Printf("rollback: remove %s failed: %v", currentLink, err)
@@ -839,7 +620,7 @@ func pruneReleases(releasesDir string, keep int, protected ...string) error {
 	return errors.Join(errs...)
 }
 
-func (d *S3MagentoDeployer) isLeader() bool { return leaderFromEnv(d.cfg.Deploy) }
+func (d *CodeDeployer) isLeader() bool { return leaderFromEnv(d.cfg.Deploy) }
 
 // leaderFromEnv reports whether this server is the leader: the variable leader_env_var, else leader_default.
 func leaderFromEnv(dc DeployConfig) bool {
@@ -851,7 +632,7 @@ func leaderFromEnv(dc DeployConfig) bool {
 }
 
 // healthCheck retries up to HealthCheck.Attempts times, waiting RetryIntervalSeconds between attempts.
-func (d *S3MagentoDeployer) healthCheck(ctx context.Context, releaseVersion string) error {
+func (d *CodeDeployer) healthCheck(ctx context.Context, releaseVersion string) error {
 	if d.cfg.Deploy.DefaultDomain == "" {
 		return errors.New("deploy.default_domain is required for health check")
 	}
@@ -874,14 +655,13 @@ func (d *S3MagentoDeployer) healthCheck(ctx context.Context, releaseVersion stri
 }
 
 // healthCheckURL is <scheme>://<deploy.default_domain>/<path_template with the escaped release version>.
-// The host comes from the config only, never from the webhook payload: the webhook may only repeat
-// the configured domain, and the release version can only land in the path or query.
-func (d *S3MagentoDeployer) healthCheckURL(releaseVersion string) string {
+// The host comes from the config only; the release version can only land in the path or query.
+func (d *CodeDeployer) healthCheckURL(releaseVersion string) string {
 	path := fmt.Sprintf(d.cfg.HealthCheck.PathTemplate, url.QueryEscape(releaseVersion))
 	return fmt.Sprintf("%s://%s/%s", d.cfg.HealthCheck.Scheme, d.cfg.Deploy.DefaultDomain, strings.TrimPrefix(path, "/"))
 }
 
-func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, releaseVersion string) error {
+func (d *CodeDeployer) healthCheckOnce(ctx context.Context, releaseVersion string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.healthCheckURL(releaseVersion), nil)
 	if err != nil {
 		return err
@@ -901,78 +681,6 @@ func (d *S3MagentoDeployer) healthCheckOnce(ctx context.Context, releaseVersion 
 	return nil
 }
 
-// downloadArtifact writes the S3 object to destination and returns its sha256 as "sha256:<hex>".
-func (d *S3MagentoDeployer) downloadArtifact(ctx context.Context, brand, artifact, destination string) (string, error) {
-	return downloadS3(ctx, d.cfg.Deploy, brand, d.cfg.Deploy.S3Prefix, artifact, destination)
-}
-
-// downloadS3 writes s3://<bucket>/<prefix>/<artifact> to destination and returns its sha256 as "sha256:<hex>".
-// Bucket, endpoint, region and path style come from the deploy section; the bucket is the brand with
-// s3_bucket_per_brand.
-func downloadS3(ctx context.Context, dc DeployConfig, brand, prefix, artifact, destination string) (string, error) {
-	bucket := dc.S3Bucket
-	if dc.S3BucketPerBrand {
-		bucket = brand
-	}
-	if bucket == "" {
-		return "", errors.New("s3 bucket is not configured")
-	}
-
-	prefix = strings.Trim(prefix, "/")
-	artifactPath := artifact
-	if prefix != "" {
-		artifactPath = prefix + "/" + artifact
-	}
-	s3URI := fmt.Sprintf("s3://%s/%s", bucket, artifactPath)
-
-	loadOptions := []func(*sdkconfig.LoadOptions) error{
-		sdkconfig.WithRegion(dc.S3Region),
-	}
-	if dc.S3Endpoint != "" {
-		resolver := awsv2.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (awsv2.Endpoint, error) {
-			if service == s3.ServiceID {
-				return awsv2.Endpoint{
-					URL:               dc.S3Endpoint,
-					HostnameImmutable: true,
-				}, nil
-			}
-			return awsv2.Endpoint{}, &awsv2.EndpointNotFoundError{}
-		})
-		loadOptions = append(loadOptions, sdkconfig.WithEndpointResolverWithOptions(resolver))
-	}
-
-	awsCfg, err := sdkconfig.LoadDefaultConfig(ctx, loadOptions...)
-	if err != nil {
-		return "", fmt.Errorf("load aws config: %w", err)
-	}
-
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = dc.S3UsePathStyle
-	})
-
-	obj, err := client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: awsv2.String(bucket),
-		Key:    awsv2.String(artifactPath),
-	})
-	if err != nil {
-		return "", fmt.Errorf("download artifact %s: %w", s3URI, err)
-	}
-	defer obj.Body.Close()
-
-	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
-	if err != nil {
-		return "", fmt.Errorf("create local artifact file: %w", err)
-	}
-	digest, err := copyWithSHA256(out, obj.Body)
-	if closeErr := out.Close(); err == nil && closeErr != nil {
-		err = closeErr
-	}
-	if err != nil {
-		return "", fmt.Errorf("write downloaded artifact: %w", err)
-	}
-	return digest, nil
-}
-
 // copyWithSHA256 copies src to dst and returns the sha256 of the copied bytes as "sha256:<hex>".
 func copyWithSHA256(dst io.Writer, src io.Reader) (string, error) {
 	h := sha256.New()
@@ -982,12 +690,8 @@ func copyWithSHA256(dst io.Writer, src io.Reader) (string, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// verifyArtifactDigest compares the expected payload digest with the downloaded one.
-// An empty expected digest is accepted; the webhook handler decides whether it is allowed.
+// verifyArtifactDigest compares the expected digest (the layer digest of the release) with the downloaded one.
 func verifyArtifactDigest(expected, actual string) error {
-	if expected == "" {
-		return nil
-	}
 	if !strings.EqualFold(expected, actual) {
 		return fmt.Errorf("artifact digest mismatch: expected %s, got %s", strings.ToLower(expected), actual)
 	}
@@ -1062,24 +766,6 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func normalizeReleaseVersion(artifactName string) string {
-	name := filepath.Base(artifactName)
-	name = strings.TrimPrefix(name, "release_")
-	name = strings.TrimSuffix(name, ".tar.gz")
-	name = strings.TrimSuffix(name, ".tgz")
-	if name == "" {
-		return "unknown-release"
-	}
-	return name
-}
-
-func exceedsTimestampWindow(now, timestamp, window int64) bool {
-	if now >= timestamp {
-		return now-timestamp > window
-	}
-	return timestamp-now > window
-}
-
 // requireInside fails when dir, with symlinks resolved as far as it exists, is not inside base.
 func requireInside(base, dir string) error {
 	realBase, err := filepath.EvalSymlinks(base)
@@ -1120,23 +806,6 @@ func safeJoin(base, unsafePath string) (string, error) {
 	return target, nil
 }
 
-func isValidPayloadPathFields(brand, artifactName string) bool {
-	if !brandPattern.MatchString(brand) {
-		return false
-	}
-	if filepath.Base(artifactName) != artifactName {
-		return false
-	}
-	return artifactPattern.MatchString(artifactName)
-}
-
-func requireMatchOrEmpty(requested, configured string) (string, error) {
-	if requested != "" && requested != configured {
-		return "", errors.New("override value does not match configured value")
-	}
-	return configured, nil
-}
-
 func (c Config) validate() error {
 	if c.Deploy.DefaultBrand == "" || !brandPattern.MatchString(c.Deploy.DefaultBrand) {
 		return errors.New("deploy.default_brand is required and must match [A-Za-z0-9._-]+")
@@ -1144,36 +813,19 @@ func (c Config) validate() error {
 	if c.Deploy.DefaultDomain == "" {
 		return errors.New("deploy.default_domain is required")
 	}
-	if c.Deploy.S3Endpoint != "" {
-		u, err := url.Parse(c.Deploy.S3Endpoint)
-		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-			return errors.New("deploy.s3_endpoint must be a valid http/https URL")
-		}
-	}
-	if err := validateSource("deploy.source", c.Deploy.Source); err != nil {
+	if err := validateOCIRepository("deploy.oci_repository", c.Deploy.OCIRepository); err != nil {
 		return err
 	}
-	if c.Deploy.Source == sourceOCI {
-		if err := validateOCIRepository("deploy.oci_repository", c.Deploy.OCIRepository); err != nil {
-			return err
-		}
-	}
-	if c.Stack.Enabled && c.Stack.Source == sourceS3 && !c.Deploy.S3BucketPerBrand && c.Deploy.S3Bucket == "" {
-		return errors.New("stack deploys download from S3: set deploy.s3_bucket or deploy.s3_bucket_per_brand")
-	}
-	if (c.WebhookSecret == "") != (c.HMACKey == "") {
-		return errors.New("webhook_secret and hmac_key go together: set both for the webhook, or neither")
+	if c.Deploy.CosignPublicKey == "" {
+		return errors.New("deploy.cosign_public_key is required: releases are only deployed when their signature verifies")
 	}
 	if err := c.Stack.validate(); err != nil {
 		return err
 	}
-	return c.Watch.validate(c)
+	return c.Watch.validate()
 }
 
-// webhookEnabled: the webhook only runs with both secrets.
-func (c Config) webhookEnabled() bool { return c.WebhookSecret != "" && c.HMACKey != "" }
-
-// listens: the webhook, or watch with its check or status endpoint, needs listen_addr.
+// listens: the check or status endpoint of the watch needs listen_addr.
 func (c Config) listens() bool {
-	return c.webhookEnabled() || (c.Watch.Enabled && (endpoint(c.Watch.CheckPath) != "" || endpoint(c.Watch.StatusPath) != ""))
+	return endpoint(c.Watch.CheckPath) != "" || endpoint(c.Watch.StatusPath) != ""
 }

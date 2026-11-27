@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-// watchEnv is a bootstrapEnv with watch enabled and a watcher on a settable clock.
+// watchEnv is a bootstrapEnv with a watcher on a settable clock.
 func watchEnv(t *testing.T) (*bootstrapEnv, *watcher, *time.Time) {
 	t.Helper()
 	e := newBootstrapEnv(t)
-	e.cfg.Watch = WatchConfig{Enabled: true}
+	e.cfg.Watch = WatchConfig{}
 	e.cfg.Watch.applyDefaults()
 	if err := e.cfg.validate(); err != nil {
 		t.Fatal(err)
@@ -191,9 +191,9 @@ func TestWatchEndpoints(t *testing.T) {
 	if st.Code.Version != "v1.0.0" || st.Code.Tag != "production" || st.Stack == nil || st.Stack.Version != "v1.0.0" {
 		t.Fatalf("status %s", rec.Body)
 	}
-	// no webhook secrets: the webhook path does not exist
+	// there is no deploy request
 	if rec := do(http.MethodPost, "/deploy"); rec.Code != http.StatusNotFound {
-		t.Fatalf("webhook without secrets: %d", rec.Code)
+		t.Fatalf("POST /deploy: %d", rec.Code)
 	}
 }
 
@@ -202,21 +202,18 @@ func TestWatchConfigValidate(t *testing.T) {
 		change func(*Config)
 		want   string
 	}{
-		"ok":                    {func(*Config) {}, ""},
-		"endpoints disabled":    {func(c *Config) { c.Watch.CheckPath, c.Watch.StatusPath = "-", "-" }, ""},
-		"interval too short":    {func(c *Config) { c.Watch.IntervalSeconds = 10 }, "at least 30"},
-		"code from s3":          {func(c *Config) { c.Deploy.Source = sourceS3; c.Deploy.S3BucketPerBrand = true }, "deploy.source oci"},
-		"code without key":      {func(c *Config) { c.Deploy.CosignPublicKey = "" }, "cosign_public_key"},
-		"stack unsigned":        {func(c *Config) { c.Stack.AllowUnsignedBundle = true }, "allow_unsigned_bundle"},
-		"bad tag":               {func(c *Config) { c.Watch.CodeTag = "../x" }, "watch.code_tag"},
-		"check on webhook path": {func(c *Config) { c.Watch.CheckPath = "/deploy" }, "differ from webhook_path"},
-		"same paths":            {func(c *Config) { c.Watch.StatusPath = "/check" }, "must differ"},
-		"secret without hmac":   {func(c *Config) { c.WebhookSecret = "s" }, "go together"},
+		"ok":                 {func(*Config) {}, ""},
+		"endpoints disabled": {func(c *Config) { c.Watch.CheckPath, c.Watch.StatusPath = "-", "-" }, ""},
+		"interval too short": {func(c *Config) { c.Watch.IntervalSeconds = 10 }, "at least 30"},
+		"code without key":   {func(c *Config) { c.Deploy.CosignPublicKey = "" }, "cosign_public_key"},
+		"bad tag":            {func(c *Config) { c.Watch.CodeTag = "../x" }, "watch.code_tag"},
+		"relative path":      {func(c *Config) { c.Watch.CheckPath = "check" }, "must start with /"},
+		"same paths":         {func(c *Config) { c.Watch.StatusPath = "/check" }, "must differ"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newBootstrapEnv(t)
 			cfg := e.cfg
-			cfg.Watch = WatchConfig{Enabled: true}
+			cfg.Watch = WatchConfig{}
 			cfg.Watch.applyDefaults()
 			tc.change(&cfg)
 			err := cfg.validate()
@@ -228,18 +225,18 @@ func TestWatchConfigValidate(t *testing.T) {
 }
 
 func TestConfigListens(t *testing.T) {
-	c := Config{Watch: WatchConfig{Enabled: true}}
+	c := Config{}
 	c.Watch.applyDefaults()
 	if !c.listens() {
 		t.Fatal("watch with /check and /status needs listen_addr")
 	}
-	c.Watch.CheckPath, c.Watch.StatusPath = "-", "-"
-	if c.listens() {
-		t.Fatal("watch without endpoints and without webhook must not listen")
-	}
-	c.WebhookSecret, c.HMACKey = "s", "h"
+	c.Watch.CheckPath = "-"
 	if !c.listens() {
-		t.Fatal("the webhook needs listen_addr")
+		t.Fatal("/status alone needs listen_addr")
+	}
+	c.Watch.StatusPath = "-"
+	if c.listens() {
+		t.Fatal("watch without endpoints must not listen")
 	}
 }
 

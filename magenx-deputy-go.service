@@ -1,5 +1,5 @@
 [Unit]
-Description=Magenx Deputy (Magento release deployment webhook listener)
+Description=Magenx Deputy (Magento and stack releases from the OCI registry)
 After=network-online.target
 Wants=network-online.target
 
@@ -19,7 +19,7 @@ Group=root
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
 AmbientCapabilities=
 
-# Optional: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IS_LEADER=true|false, REGISTRY_PASSWORD, ...
+# Optional: IS_LEADER=true|false, REGISTRY_PASSWORD, ...
 EnvironmentFile=-/etc/magenx-deputy-go/env
 
 StandardOutput=journal

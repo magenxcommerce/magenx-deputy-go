@@ -10,11 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 const fakeDocker = `#!/bin/sh
@@ -46,7 +44,7 @@ type stackEnv struct {
 	deployer *StackDeployer
 
 	mu        sync.Mutex
-	objects   map[string][]byte // S3 objects of the stack prefix
+	objects   map[string][]byte // bundles in the registry, by file name stack_<tag>.tar.gz
 	downloads []string
 }
 
@@ -82,9 +80,13 @@ func newStackEnv(t *testing.T) *stackEnv {
 	writeFile(t, filepath.Join(e.shared, ".env.secrets"), "SECRET=1\n", 0o600)
 
 	cfg := Config{
-		Deploy: DeployConfig{DefaultBrand: "shop", DefaultDomain: "shop.example", S3BucketPerBrand: true},
+		Deploy: DeployConfig{
+			DefaultBrand: "shop", DefaultDomain: "shop.example",
+			OCIRepository: "ghcr.io/acme/magento-release", CosignPublicKey: filepath.Join(e.fake, "cosign.pub"),
+		},
 		Stack: StackConfig{
 			Enabled:         true,
+			OCIRepository:   "ghcr.io/acme/stack",
 			Dir:             e.dir,
 			DockerBinary:    docker,
 			CosignBinary:    cosign,
@@ -104,7 +106,7 @@ func newStackEnv(t *testing.T) *stackEnv {
 		t.Fatal(err)
 	}
 	e.deployer = newStackDeployer(cfg, newRunner(id, []string{"FAKE_DIR=" + e.fake}))
-	e.deployer.download = e.fakeS3
+	e.deployer.download = e.fakeRegistry
 	if err := e.deployer.checkTools(); err != nil {
 		t.Fatal(err)
 	}
@@ -118,13 +120,14 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 	}
 }
 
-func (e *stackEnv) fakeS3(_ context.Context, name, destination string) (string, error) {
+func (e *stackEnv) fakeRegistry(_ context.Context, tag, destination string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	name := stackBundleName(tag)
 	e.downloads = append(e.downloads, name)
 	b, ok := e.objects[name]
 	if !ok {
-		return "", fmt.Errorf("download artifact s3://shop/stack/%s: NoSuchKey", name)
+		return "", fmt.Errorf("resolve ghcr.io/acme/stack:%s: MANIFEST_UNKNOWN", tag)
 	}
 	if err := os.WriteFile(destination, b, 0o640); err != nil {
 		return "", err
@@ -132,7 +135,7 @@ func (e *stackEnv) fakeS3(_ context.Context, name, destination string) (string, 
 	return digestOf(b), nil
 }
 
-// addRelease uploads stack_<tag>.tar.gz (repo files + lock) and its signature, returns the bundle digest.
+// addRelease pushes stack_<tag>.tar.gz (repo files + lock), returns the bundle digest.
 func (e *stackEnv) addRelease(tag string, images map[string]string, files map[string]string) string {
 	e.t.Helper()
 	if images == nil {
@@ -153,7 +156,6 @@ func (e *stackEnv) addRelease(tag string, images map[string]string, files map[st
 	bundle := makeBundle(e.t, all)
 	e.mu.Lock()
 	e.objects[stackBundleName(tag)] = bundle
-	e.objects[stackBundleName(tag)+".sig"] = []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}`)
 	e.mu.Unlock()
 	return digestOf(bundle)
 }
@@ -181,7 +183,7 @@ func makeBundle(t *testing.T, files map[string]string) []byte {
 }
 
 func (e *stackEnv) deploy(tag, digest string, confirm ...string) error {
-	return e.deployer.Deploy(context.Background(), DeployPayload{Kind: "stack", Tag: tag, ArtifactDigest: digest, Confirm: confirm})
+	return e.deployer.Deploy(context.Background(), Release{Tag: tag, ArtifactDigest: digest, Confirm: confirm})
 }
 
 func (e *stackEnv) current() string {
@@ -218,7 +220,7 @@ func TestStackDeploySuccess(t *testing.T) {
 	if e.current() != "v1.0.0" {
 		t.Fatalf("current=%q", e.current())
 	}
-	if got := strings.Join(e.downloads, " "); got != "stack_v1.0.0.tar.gz stack_v1.0.0.tar.gz.sig" {
+	if got := strings.Join(e.downloads, " "); got != "stack_v1.0.0.tar.gz" {
 		t.Fatalf("downloads=%q", got)
 	}
 	release := filepath.Join(e.dir, "releases", "v1.0.0")
@@ -238,9 +240,6 @@ func TestStackDeploySuccess(t *testing.T) {
 
 	log := e.log()
 	key := e.deployer.cfg.CosignPublicKey
-	if !strings.Contains(log, "cosign verify-blob --key "+key+" --insecure-ignore-tlog=true --bundle ") || !strings.Contains(log, "stack_v1.0.0.tar.gz.sig ") {
-		t.Fatalf("bundle not verified\n%s", log)
-	}
 	if n := strings.Count(log, "cosign verify --key "+key+" --insecure-ignore-tlog=true ghcr.io/acme/"); n != 3 {
 		t.Fatalf("cosign verify calls=%d\n%s", n, log)
 	}
@@ -291,16 +290,7 @@ func TestStackDeployRefusesBadBundles(t *testing.T) {
 			e.addRelease("v1", nil, nil)
 			return "sha256:" + strings.Repeat("0", 64)
 		}, "artifact digest mismatch"},
-		{"missing bundle", func(e *stackEnv) string { return "" }, "NoSuchKey"},
-		{"missing signature", func(e *stackEnv) string {
-			d := e.addRelease("v1", nil, nil)
-			delete(e.objects, "stack_v1.tar.gz.sig")
-			return d
-		}, "bundle signature"},
-		{"bad signature", func(e *stackEnv) string {
-			e.fail("cosign", "verify-blob")
-			return e.addRelease("v1", nil, nil)
-		}, "bundle signature check failed"},
+		{"missing bundle", func(e *stackEnv) string { return "sha256:" + strings.Repeat("1", 64) }, "MANIFEST_UNKNOWN"},
 		{"unsigned image", func(e *stackEnv) string {
 			e.fail("cosign", "shop-nginx")
 			return e.addRelease("v1", nil, nil)
@@ -342,19 +332,6 @@ func TestStackDeployRefusesBadBundles(t *testing.T) {
 				t.Fatalf("%d release dirs left behind", n)
 			}
 		})
-	}
-}
-
-func TestStackDeployUnsignedBundleAllowed(t *testing.T) {
-	e := newStackEnv(t)
-	e.deployer.cfg.AllowUnsignedBundle = true
-	digest := e.addRelease("v1", nil, nil)
-	delete(e.objects, "stack_v1.tar.gz.sig")
-	if err := e.deploy("v1", digest); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(e.log(), "verify-blob") {
-		t.Fatal("bundle signature checked although allow_unsigned_bundle")
 	}
 }
 
@@ -564,8 +541,8 @@ func TestStackDeployHealthCheck(t *testing.T) {
 func TestStackConfigValidate(t *testing.T) {
 	base := func() Config {
 		c := Config{
-			Deploy: DeployConfig{DefaultBrand: "Shop", DefaultDomain: "shop.example", S3Bucket: "b"},
-			Stack:  StackConfig{Enabled: true, CosignPublicKey: "/etc/k.pub"},
+			Deploy: DeployConfig{DefaultBrand: "Shop", DefaultDomain: "shop.example", OCIRepository: "ghcr.io/acme/release", CosignPublicKey: "/etc/k.pub"},
+			Stack:  StackConfig{Enabled: true, OCIRepository: "ghcr.io/acme/stack", CosignPublicKey: "/etc/k.pub"},
 		}
 		c.applyDefaults()
 		return c
@@ -574,12 +551,14 @@ func TestStackConfigValidate(t *testing.T) {
 	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
-	if c.Stack.Dir != "/opt/Shop/stack" || c.Stack.ProjectName != "shop" || c.Stack.S3Prefix != "stack" {
-		t.Fatalf("defaults: dir=%q project=%q prefix=%q", c.Stack.Dir, c.Stack.ProjectName, c.Stack.S3Prefix)
+	if c.Stack.Dir != "/opt/Shop/stack" || c.Stack.ProjectName != "shop" {
+		t.Fatalf("defaults: dir=%q project=%q", c.Stack.Dir, c.Stack.ProjectName)
 	}
 	for name, mutate := range map[string]func(*Config){
-		"no bucket":     func(c *Config) { c.Deploy.S3Bucket = "" },
+		"no repository": func(c *Config) { c.Stack.OCIRepository = "" },
 		"no key":        func(c *Config) { c.Stack.CosignPublicKey = "" },
+		"no code key":   func(c *Config) { c.Deploy.CosignPublicKey = "" },
+		"no code repo":  func(c *Config) { c.Deploy.OCIRepository = "" },
 		"relative dir":  func(c *Config) { c.Stack.Dir = "stack" },
 		"env outside":   func(c *Config) { c.Stack.EnvFiles = []string{"../.env"} },
 		"bad service":   func(c *Config) { c.Stack.ExcludeServices = []string{"-x"} },
@@ -595,73 +574,21 @@ func TestStackConfigValidate(t *testing.T) {
 	}
 }
 
-func TestWebhookStackPayload(t *testing.T) {
-	cfg := Config{
-		WebhookPath:   "/deploy",
-		WebhookSecret: "secret",
-		HMACKey:       "hmac",
-		Deploy:        DeployConfig{DefaultBrand: "demo", DefaultDomain: "shop.example"},
-	}
-	cfg.applyDefaults()
-	send := func(s *Server, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body))
-		req.Header.Set("X-Webhook-Secret", "secret")
-		req.Header.Set("X-Signature", sign("hmac", []byte(body)))
-		req.Header.Set("X-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
-		res := httptest.NewRecorder()
-		s.ServeHTTP(res, req)
-		return res
-	}
-	digest := `"artifact_digest":"` + testDigest + `"`
-
-	code, stack := &recordingDeployer{}, &recordingDeployer{}
-	disabled := &Server{cfg: cfg, deployer: code}
-	if res := send(disabled, `{"kind":"stack","tag":"v1.0.0",`+digest+`}`); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "not enabled") {
-		t.Fatalf("stack disabled: %d %s", res.Code, res.Body)
-	}
-
-	enabled := &Server{cfg: cfg, deployer: code, stack: stack}
-	for body, want := range map[string]string{
-		`{"kind":"stack",` + digest + `}`:                                          "tag is required",
-		`{"kind":"stack","tag":"../x",` + digest + `}`:                             "tag is required",
-		`{"kind":"stack","tag":"v1"}`:                                              "artifact_digest is required",
-		`{"kind":"stack","tag":"v1","artifact_name":"../a.tar.gz",` + digest + `}`: "invalid artifact_name",
-		`{"kind":"stack","tag":"v1","brand":"other",` + digest + `}`:               "brand does not match",
-		`{"kind":"stack","tag":"v1","confirm":["a b"],` + digest + `}`:             "invalid service name",
-		`{"kind":"other","tag":"v1"}`:                                              "unknown kind",
-	} {
-		if res := send(enabled, body); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), want) {
-			t.Errorf("%s: %d %q want %q", body, res.Code, res.Body, want)
-		}
-	}
-	if len(code.calls)+len(stack.calls) != 0 {
-		t.Fatalf("invalid payloads deployed: %v %v", code.calls, stack.calls)
-	}
-
-	if res := send(enabled, `{"kind":"stack","tag":"v1.0.0",`+digest+`,"confirm":["mariadb"]}`); res.Code != http.StatusOK {
-		t.Fatalf("stack: %d %s", res.Code, res.Body)
-	}
-	got := stack.calls[0]
-	if len(stack.calls) != 1 || got.Tag != "v1.0.0" || got.ArtifactName != "stack_v1.0.0.tar.gz" || got.Confirm[0] != "mariadb" || len(code.calls) != 0 {
-		t.Fatalf("stack calls=%v code calls=%v", stack.calls, code.calls)
-	}
-}
-
 func TestStackDeployRefusesUnsafeNames(t *testing.T) {
 	e := newStackEnv(t)
-	for _, p := range []DeployPayload{
-		{Tag: "../v1"},
-		{Tag: "v1..2"},
-		{Tag: ".hidden"},
-		{Tag: "v1", ArtifactName: "../stack_v1.tar.gz"},
-		{Tag: "v1", ArtifactName: "stack_..tar.gz"},
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, rel := range []Release{
+		{Tag: "../v1", ArtifactDigest: digest},
+		{Tag: "v1..2", ArtifactDigest: digest},
+		{Tag: ".hidden", ArtifactDigest: digest},
+		{Tag: "v1"},
+		{Tag: "v1", ArtifactDigest: digest, Confirm: []string{"a b"}},
 	} {
-		p.Kind = "stack"
-		if err := e.deployer.Deploy(context.Background(), p); err == nil || !strings.Contains(err.Error(), "invalid") {
-			t.Errorf("%+v: err=%v", p, err)
+		if err := e.deployer.Deploy(context.Background(), rel); err == nil || !strings.Contains(err.Error(), "invalid") {
+			t.Errorf("%+v: err=%v", rel, err)
 		}
 	}
 	if len(e.downloads) != 0 || e.releaseCount() != 0 {
-		t.Fatalf("refused payloads downloaded %v or left releases", e.downloads)
+		t.Fatalf("refused releases downloaded %v or left releases", e.downloads)
 	}
 }

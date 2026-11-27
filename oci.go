@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,15 +22,11 @@ import (
 
 // Release archives in an OCI registry (e.g. ghcr.io): one image manifest per release whose single layer is
 // the archive itself, pushed with "crane append -f release.tar.gz", so the layer digest is the sha256 of the
-// archive, the same value as artifact_digest. The release version is the manifest annotation
-// org.opencontainers.image.version; bootstrap reads it to turn a moving tag (production) into the version.
+// archive. The release version is the manifest annotation org.opencontainers.image.version; watch and
+// bootstrap read it to turn a moving tag (production) into the version.
 
-const (
-	sourceS3  = "s3"
-	sourceOCI = "oci"
-	// ociVersionAnnotation on the manifest names the release version of a moving tag.
-	ociVersionAnnotation = "org.opencontainers.image.version"
-)
+// ociVersionAnnotation on the manifest names the release version of a moving tag.
+const ociVersionAnnotation = "org.opencontainers.image.version"
 
 // OCIConfig is the registry login of deputy's own pulls (archives and their signatures). docker pulls of the
 // stack images use stack.registry_username instead.
@@ -185,7 +180,7 @@ func (c ociClient) fetch(ctx context.Context, repository, tag, expectedDigest, d
 		return "", err
 	}
 	if expectedDigest != "" && !strings.EqualFold(expectedDigest, a.LayerDigest) {
-		return "", fmt.Errorf("%s:%s holds %s, the webhook expects %s", a.Repository, tag, a.LayerDigest, strings.ToLower(expectedDigest))
+		return "", fmt.Errorf("%s:%s holds %s, expected %s", a.Repository, tag, a.LayerDigest, strings.ToLower(expectedDigest))
 	}
 	if verify != nil {
 		if err := verify(ctx, a); err != nil {
@@ -245,7 +240,7 @@ func (c ociClient) dockerConfig(repository string) (string, error) {
 // validateOCIRepository checks a repository name from the config: registry/path, no tag or digest.
 func validateOCIRepository(field, repository string) error {
 	if repository == "" {
-		return fmt.Errorf("%s is required with source %s", field, sourceOCI)
+		return fmt.Errorf("%s is required", field)
 	}
 	if strings.ContainsAny(repository, "@") || strings.Contains(repository[strings.LastIndex(repository, "/")+1:], ":") {
 		return fmt.Errorf("%s must be a repository without tag or digest, e.g. ghcr.io/acme/magento-release", field)
@@ -254,12 +249,4 @@ func validateOCIRepository(field, repository string) error {
 		return fmt.Errorf("%s: %w", field, err)
 	}
 	return nil
-}
-
-func validateSource(field, source string) error {
-	switch source {
-	case sourceS3, sourceOCI:
-		return nil
-	}
-	return errors.New(field + " must be s3 or oci")
 }
