@@ -384,6 +384,66 @@ func TestBootstrapDeploysStackThenCode(t *testing.T) {
 	}
 }
 
+// moving the tag back to a release whose dir exists deploys it again into <version>-<timestamp>: the version
+// is still the release's, for bootstrap, the watch status and the pipeline wait
+func TestBootstrapRollbackByTagKeepsVersion(t *testing.T) {
+	e := newBootstrapEnv(t)
+	opts := bootstrapOptions{StackTag: "production", CodeTag: "production"}
+	for _, version := range []string{"v1.2.0", "v1.3.0", "v1.2.0"} {
+		e.pushBoth(version, "production")
+		if err := bootstrap(context.Background(), e.cfg, e.server, opts); err != nil {
+			t.Fatalf("%s: %v", version, err)
+		}
+		if got := e.codeCurrent(); got != version {
+			t.Fatalf("code version %q after deploying %s", got, version)
+		}
+		if stackTag := readReleaseFile(filepath.Join(e.cfg.Stack.Dir, "current")); stackTag != version {
+			t.Fatalf("stack version %q after deploying %s", stackTag, version)
+		}
+	}
+	target, err := os.Readlink(filepath.Join(e.cfg.Deploy.RootDir, "shop", filepath.FromSlash(e.cfg.Deploy.CurrentLinkSuffix)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := filepath.Base(target); !strings.HasPrefix(name, "v1.2.0-") {
+		t.Fatalf("rollback deployed into %s, want a new v1.2.0-<timestamp> dir", name)
+	}
+	// the same tag again: already current, no new dir
+	entries, _ := os.ReadDir(filepath.Join(e.cfg.Deploy.RootDir, "shop", "releases"))
+	if err := bootstrap(context.Background(), e.cfg, e.server, opts); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadDir(filepath.Join(e.cfg.Deploy.RootDir, "shop", "releases")); len(again) != len(entries) {
+		t.Fatalf("redeploy of the current release added a dir: %d -> %d", len(entries), len(again))
+	}
+}
+
+func TestCurrentCodeReleaseIgnoresShippedReleaseFile(t *testing.T) {
+	cfg := Config{Deploy: DeployConfig{RootDir: t.TempDir(), DefaultBrand: "shop", CurrentLinkSuffix: "current"}}
+	release := filepath.Join(cfg.Deploy.RootDir, "shop", "releases", "v2.0.0-20261127120000")
+	if err := os.MkdirAll(release, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("releases/v2.0.0-20261127120000", filepath.Join(cfg.Deploy.RootDir, "shop", "current")); err != nil {
+		t.Fatal(err)
+	}
+	// no or an invalid release file: the dir name
+	writeFile(t, filepath.Join(release, releaseFile), "../../etc\n", 0o644)
+	if got := currentCodeRelease(cfg); got != "v2.0.0-20261127120000" {
+		t.Fatalf("got %q", got)
+	}
+	id, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReleaseFile(id, release, "v2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := currentCodeRelease(cfg); got != "v2.0.0" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestBootstrapRefusals(t *testing.T) {
 	opts := bootstrapOptions{StackTag: "production", CodeTag: "production"}
 	for name, tc := range map[string]struct {
