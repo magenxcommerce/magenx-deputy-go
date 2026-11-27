@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.3.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.2.0...v2.3.0) (2026-11-27)
+
+
+### 🚀 Features
+
+* Watch moving tags instead of the webhook ([#61](https://github.com/magenxcommerce/magenx-deputy-go/issues/61)) ([e8c3c59](https://github.com/magenxcommerce/magenx-deputy-go/commit/e8c3c59214fb1408f31d9b5eccac43a248538d83))
+
+
+### 🚦 Maintenance
+
+* **main:** magenx-deputy-go 2.3.0-rc ([#62](https://github.com/magenxcommerce/magenx-deputy-go/issues/62)) ([77aaf88](https://github.com/magenxcommerce/magenx-deputy-go/commit/77aaf887dcc38e2f4f906a3d6b304c475879de2d))
+
+## [2.3.0-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.2.0...v2.3.0-rc) (2026-11-27)
+
+
+### 🚀 Features
+
+* Watch moving tags instead of the webhook ([#61](https://github.com/magenxcommerce/magenx-deputy-go/issues/61)) ([e8c3c59](https://github.com/magenxcommerce/magenx-deputy-go/commit/e8c3c59214fb1408f31d9b5eccac43a248538d83))
+
 ## [2.2.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.1.0...v2.2.0) (2026-11-26)
 
 
