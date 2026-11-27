@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.2-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.1...v2.3.2-rc) (2026-11-27)
+
+
+### 🐛 Bug Fixes
+
+* **deploy:** Report the release version, not the dir name, after a redeploy ([#67](https://github.com/magenxcommerce/magenx-deputy-go/issues/67)) ([aaa7834](https://github.com/magenxcommerce/magenx-deputy-go/commit/aaa7834f274a074086f33c3d470a482493005e0b))
+
 ## [2.3.1](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.0...v2.3.1) (2026-11-27)
 
 
