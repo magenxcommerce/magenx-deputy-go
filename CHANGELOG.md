@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.3.1](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.0...v2.3.1) (2026-11-27)
+
+
+### 🐛 Bug Fixes
+
+* Deploy lock on the config file, no directory created ([#64](https://github.com/magenxcommerce/magenx-deputy-go/issues/64)) ([1efb948](https://github.com/magenxcommerce/magenx-deputy-go/commit/1efb948cf6c3721623358ad417f22931de41254f))
+
+
+### 🚦 Maintenance
+
+* **main:** magenx-deputy-go 2.3.1-rc ([#65](https://github.com/magenxcommerce/magenx-deputy-go/issues/65)) ([f0c79bb](https://github.com/magenxcommerce/magenx-deputy-go/commit/f0c79bbe8bd4051ebc9d4b770e62204923c65f1a))
+
+## [2.3.1-rc](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.3.0...v2.3.1-rc) (2026-11-27)
+
+
+### 🐛 Bug Fixes
+
+* Deploy lock on the config file, no directory created ([#64](https://github.com/magenxcommerce/magenx-deputy-go/issues/64)) ([1efb948](https://github.com/magenxcommerce/magenx-deputy-go/commit/1efb948cf6c3721623358ad417f22931de41254f))
+
 ## [2.3.0](https://github.com/magenxcommerce/magenx-deputy-go/compare/v2.2.0...v2.3.0) (2026-11-27)
 
 
