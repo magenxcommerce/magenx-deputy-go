@@ -122,6 +122,26 @@ func (c ociClient) resolve(ctx context.Context, repository, tag string) (ociArti
 	}, nil
 }
 
+// head returns the manifest digest of repository:tag with one HEAD request: the cheap check whether a moving
+// tag changed.
+func (c ociClient) head(ctx context.Context, repository, tag string) (string, error) {
+	ref, err := name.NewTag(repository+":"+tag, name.StrictValidation)
+	if err != nil {
+		return "", fmt.Errorf("invalid reference %s:%s: %w", repository, tag, err)
+	}
+	opts, err := c.options(ctx)
+	if err != nil {
+		return "", err
+	}
+	// one attempt: the watch has its own interval and backs off on 429, retries here would only add requests
+	opts = append(opts, remote.WithRetryBackoff(remote.Backoff{Steps: 1}), remote.WithRetryStatusCodes())
+	desc, err := remote.Head(ref, opts...)
+	if err != nil {
+		return "", fmt.Errorf("check %s: %w", ref, err)
+	}
+	return desc.Digest.String(), nil
+}
+
 // download writes the archive layer of a to destination (created, must not exist) and returns its sha256 as
 // "sha256:<hex>".
 func (c ociClient) download(ctx context.Context, a ociArtifact, destination string) (string, error) {
