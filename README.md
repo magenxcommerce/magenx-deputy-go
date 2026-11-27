@@ -271,7 +271,7 @@ magenx-deputy-go bootstrap -config /etc/magenx-deputy-go/config.yaml -tag produc
 systemctl enable --now magenx-deputy-go
 ```
 
-1. waits for the deploy lock (`<root_dir>/<brand>/.deputy.lock`): bootstrap and a running service take turns
+1. waits for the deploy lock (an `flock` on the config file): bootstrap and a running service take turns
 2. stack (`stack.enabled`): resolves `<stack.oci_repository>:<tag>`, reads the release version from the manifest
    annotation `org.opencontainers.image.version`, then deploys it like a webhook with that version and the
    layer digest: `<repository>:<version>` must hold the same archive, the signature must verify
@@ -324,5 +324,5 @@ Without the webhook and with `check_path` and `status_path` set to `-` deputy op
 Several servers: the leader (`IS_LEADER=true`) runs `pre_switch_commands` (setup:upgrade). Give the others a
 `settle_seconds` longer than the leader's deploy, so the schema is upgraded before they switch.
 
-The service and `bootstrap` share the deploy lock `<root_dir>/<brand>/.deputy.lock`, so they never deploy at the
+The service and `bootstrap` share the deploy lock, an `flock` on the config file both read, so they never deploy at the
 same time.

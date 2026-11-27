@@ -244,10 +244,11 @@ func TestConfigListens(t *testing.T) {
 }
 
 func TestLockDeploysAcrossServers(t *testing.T) {
-	dir := t.TempDir()
-	cfg := Config{Deploy: DeployConfig{RootDir: dir, DefaultBrand: "shop"}}
-	// two servers stand for two processes (service and bootstrap): the flock, not the mutex, serializes them
-	a, b := &Server{cfg: cfg}, &Server{cfg: cfg}
+	config := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, config, "listen_addr: 127.0.0.1:0\n", 0o444)
+	// two servers stand for two processes (service and bootstrap): the flock on the config file, not the mutex,
+	// serializes them; the file is read-only
+	a, b := &Server{lockPath: config}, &Server{lockPath: config}
 	unlock, err := a.lockDeploys()
 	if err != nil {
 		t.Fatal(err)
@@ -271,9 +272,13 @@ func TestLockDeploysAcrossServers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("second server did not get the lock after it was released")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "shop", deployLockName)); err != nil {
+	// without a lock path only the mutex: nothing is created anywhere
+	c := &Server{}
+	u, err := c.lockDeploys()
+	if err != nil {
 		t.Fatal(err)
 	}
+	u()
 }
 
 func TestWatchRunChecksAtStartAndOnNudge(t *testing.T) {
